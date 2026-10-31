@@ -1,6 +1,6 @@
 // ============================================================================
 // File: pearl_miner_sm89_ultimate.cu
-// Version: v4.1 Cross-Platform (HiveOS Linux + Windows x64)
+// Version: v4.2 Cross-Platform (HiveOS Linux + Windows x64)
 // Target GPU: NVIDIA GeForce RTX 4070 Ti (Ada Lovelace - sm_89)
 // Default Pool: prl.kryptex.network:7048
 // Default Wallet: prl1p6zx47507v0xp8389u7rggjy4wmy02eaa6x8atnhtux3lc89mwgrqmte6lh
@@ -525,23 +525,14 @@ private:
     PearlJob current_job;
     sock_t sock = INVALID_SOCK;
 
-public:
-    PearlStratumMiner(const std::string& h, int p, const std::string& w, const std::string& wrk)
-        : host(h), port(p), wallet(w), worker(wrk) {
-        memset(&current_job, 0, sizeof(PearlJob));
-        for (int i = 0; i < 8; ++i) {
-            current_job.header_key[i] = 0x1337C0DE + i * 0x9E3779B9;
+    void close_socket() {
+        if (sock != INVALID_SOCK) {
+            CLOSE_SOCK(sock);
+            sock = INVALID_SOCK;
         }
-        current_job.target_high = 0x00000000FFFF0000ULL;
-        current_job.job_id = 1;
     }
 
-    bool running() const { return is_running.load(); }
-    void stop() { is_running.store(false); }
-    uint32_t get_accepted() const { return accepted_shares.load(); }
-    uint32_t get_rejected() const { return rejected_shares.load(); }
-
-    void connect_to_pool() {
+    void attempt_connect() {
 #ifdef _WIN32
         WSADATA wsa;
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
@@ -552,8 +543,9 @@ public:
         std::string port_str = std::to_string(port);
 
         printf("[Stratum] Connecting to %s:%d ...\n", host.c_str(), port);
+        fflush(stdout);
         if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res) {
-            printf("[Stratum] Could not resolve %s. Running in Benchmark mode.\n", host.c_str());
+            printf("[Stratum] Could not resolve %s.\n", host.c_str());
             return;
         }
 
@@ -573,18 +565,53 @@ public:
             }
             printf("[Stratum] Authenticating worker: %s\n", full_user.c_str());
 
-            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/4.1\"]}\n";
+            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/4.2\"]}\n";
             std::string auth_msg = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + full_user + "\",\"x\"]}\n";
             send(sock, sub_msg.c_str(), (int)sub_msg.size(), 0);
             send(sock, auth_msg.c_str(), (int)auth_msg.size(), 0);
 
             std::thread(&PearlStratumMiner::listen_loop, this).detach();
         } else {
-            printf("[Stratum] Pool connection timed out. Running in Benchmark mode.\n");
-            CLOSE_SOCK(sock);
-            sock = INVALID_SOCK;
+            printf("[Stratum] Pool connection failed (will retry).\n");
+            close_socket();
         }
+        fflush(stdout);
         freeaddrinfo(res);
+    }
+
+    void reconnect_loop() {
+        while (is_running.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (!is_running.load() || is_connected.load()) continue;
+            attempt_connect();
+            if (!is_connected.load()) printf("[Stratum] Next reconnect attempt in 10s...\n");
+        }
+    }
+
+
+public:
+    PearlStratumMiner(const std::string& h, int p, const std::string& w, const std::string& wrk)
+        : host(h), port(p), wallet(w), worker(wrk) {
+        memset(&current_job, 0, sizeof(PearlJob));
+        for (int i = 0; i < 8; ++i) {
+            current_job.header_key[i] = 0x1337C0DE + i * 0x9E3779B9;
+        }
+        current_job.target_high = 0x00000000FFFF0000ULL;
+        current_job.job_id = 1;
+    }
+
+    bool running() const { return is_running.load(); }
+    void stop() { is_running.store(false); }
+    uint32_t get_accepted() const { return accepted_shares.load(); }
+    uint32_t get_rejected() const { return rejected_shares.load(); }
+
+    void connect_to_pool() {
+        attempt_connect();
+        if (!is_connected.load()) {
+            printf("[Stratum] Running in Benchmark mode. Will retry connecting every 10 seconds...\n");
+        }
+        fflush(stdout);
+        std::thread(&PearlStratumMiner::reconnect_loop, this).detach();
     }
 
     void listen_loop() {
@@ -594,6 +621,7 @@ public:
             if (n <= 0) {
                 printf("\n[Stratum] Disconnected from pool.\n");
                 is_connected.store(false);
+                close_socket();
                 break;
             }
             buf[n] = '\0';
@@ -676,7 +704,9 @@ void parse_pool_url(const std::string& input, std::string& out_host, int& out_po
 // نوشتن فایل تلمتری JSON برای خواندن توسط اسکریپت h-stats.sh در HiveOS
 void write_hiveos_telemetry(const std::string& stats_path, double th_per_sec, unsigned int temp_c, unsigned int fan_pct, double power_w, uint64_t uptime_sec, uint32_t acc, uint32_t rej) {
     if (stats_path.empty()) return;
-    FILE* fp = fopen(stats_path.c_str(), "w");
+    // نوشتن اتمیک: اول در فایل tmp و بعد rename، تا h-stats.sh هرگز JSON نیمهکاره نخواند
+    std::string tmp_path = stats_path + ".tmp";
+    FILE* fp = fopen(tmp_path.c_str(), "w");
     if (!fp) return;
     // در HiveOS، واحد khs یا hs گزارش می‌شود (تبدیل TH/s به kH/s برای نمودار استاندارد HiveOS)
     double khs = th_per_sec * 1e9;
@@ -694,6 +724,12 @@ void write_hiveos_telemetry(const std::string& stats_path, double th_per_sec, un
             th_per_sec, khs, temp_c, fan_pct, power_w,
             (unsigned long long)uptime_sec, acc, rej);
     fclose(fp);
+#ifdef _WIN32
+    remove(stats_path.c_str());
+#endif
+    if (std::rename(tmp_path.c_str(), stats_path.c_str()) != 0) {
+        remove(tmp_path.c_str());
+    }
 }
 
 // ============================================================================
@@ -724,7 +760,7 @@ int main(int argc, char* argv[]) {
     }
 
     printf("====================================================================\n");
-    printf("  PearlHash SM89 Ultimate v4.1 (HiveOS & Windows - RTX 4070 Ti)\n");
+    printf("  PearlHash SM89 Ultimate v4.2 (HiveOS & Windows - RTX 4070 Ti)\n");
     printf("  Pool Address  : %s:%d\n", pool_host.c_str(), pool_port);
     printf("  Wallet Address: %s\n", wallet.c_str());
     printf("====================================================================\n\n");
@@ -736,6 +772,7 @@ int main(int argc, char* argv[]) {
 #else
     signal(SIGINT, posix_signal_handler);
     signal(SIGTERM, posix_signal_handler);
+    signal(SIGPIPE, SIG_IGN);
 #endif
 
     g_nvml_ctrl.initialize_and_sleep_vram(0, target_core_mhz);
@@ -754,6 +791,13 @@ int main(int argc, char* argv[]) {
     printf("[GPU 0] Device Name       : %s\n", props.name);
     printf("[GPU 0] Compute Capability: sm_%d%d (%d SMs | %d MB L2 Cache | VRAM Deep-Sleep)\n",
            props.major, props.minor, props.multiProcessorCount, props.l2CacheSize / (1024 * 1024));
+
+    if (props.major != 8 || props.minor != 9) {
+        printf("[Warning] This binary contains ONLY sm_89 SASS code, but this GPU is sm_%d%d.\n",
+               props.major, props.minor);
+        printf("[Warning] The kernel will NOT run! Use an RTX 40-series (Ada Lovelace) GPU.\n");
+        fflush(stdout);
+    }
 
     cudaSetDeviceFlags(cudaDeviceMapHost | cudaDeviceScheduleSpin);
     cudaSetDevice(device_id);
@@ -812,6 +856,16 @@ int main(int argc, char* argv[]) {
         cudaGraphInstantiate(&graph_execs[s], graphs[s], nullptr, nullptr, 0);
     }
 
+    {
+        cudaError_t g_err = cudaGetLastError();
+        if (g_err != cudaSuccess) {
+            printf("[CUDA Error] Graph creation failed: %s\n", cudaGetErrorString(g_err));
+            printf("[CUDA Error] Aborting (see warning about sm_89 above).\n");
+            g_nvml_ctrl.restore_defaults();
+            return -1;
+        }
+    }
+
     uint64_t nonce_cursor = 0;
     uint32_t last_seen_job_id = init_job.job_id;
 
@@ -848,6 +902,14 @@ int main(int argc, char* argv[]) {
 
         cudaStreamSynchronize(streams[current_stream]);
 
+        {
+            cudaError_t sync_err = cudaGetLastError();
+            if (sync_err != cudaSuccess) {
+                printf("[CUDA Error] Kernel stream error: %s\n", cudaGetErrorString(sync_err));
+                fflush(stdout);
+            }
+        }
+
         uint32_t found = h_results[current_stream]->found_count;
         if (found > 0) {
             uint32_t count = (found > 8) ? 8 : found;
@@ -878,7 +940,7 @@ int main(int argc, char* argv[]) {
             write_hiveos_telemetry(stats_file, terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
                                    uptime, miner.get_accepted(), miner.get_rejected());
 
-            printf("[Speed v4.1] %.2f TH/s | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u\n",
+            printf("[Speed v4.2] %.2f TH/s | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u\n",
                    terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
                    miner.get_accepted(), miner.get_rejected());
             fflush(stdout);

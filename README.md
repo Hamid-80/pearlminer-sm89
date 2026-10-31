@@ -2,7 +2,7 @@
 
 Custom PearlHash (pearlhash) miner for HiveOS, built automatically with GitHub Actions on every push to `main`.
 
-**Download:** [pearlminer_sm89-4.1.tar.gz](https://github.com/Hamid-80/pearlminer-sm89/releases/download/v4.1/pearlminer_sm89-4.1.tar.gz)
+**Download:** [pearlminer_sm89-4.2.tar.gz](https://github.com/Hamid-80/pearlminer-sm89/releases/download/v4.2/pearlminer_sm89-4.2.tar.gz)
 
 ## HiveOS Flight Sheet
 

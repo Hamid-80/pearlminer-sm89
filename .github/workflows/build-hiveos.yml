@@ -26,6 +26,7 @@ jobs:
         run: |
           mkdir -p pearlminer_sm89
           nvcc -O3 -arch=sm_89 --use_fast_math -maxrregcount=96 -Xptxas="-v,-dlcm=ca" \
+            -static-libstdc++ -static-libgcc \
             pearl_miner_sm89_ultimate.cu -o pearlminer_sm89/pearlminer_sm89 -lpthread -ldl
           chmod +x pearlminer_sm89/pearlminer_sm89
 
@@ -35,7 +36,8 @@ jobs:
 
           cat << 'EOF' > pearlminer_sm89/h-manifest.conf
           MINER_NAME=pearlminer_sm89
-          MINER_VERSION=4.1
+          MINER_VER=4.2
+          MINER_VERSION=4.2
           MINER_API_PORT=60050
           CUSTOM_LOG_BASEDIR=/var/log/miner/custom
           EOF
@@ -48,30 +50,38 @@ jobs:
 
           cat << 'EOF' > pearlminer_sm89/h-run.sh
           #!/usr/bin/env bash
-          cd /hive/miners/custom/pearlminer_sm89
+          cd /hive/miners/custom/pearlminer_sm89 || exit 1
+          if [[ ! -x ./pearlminer_sm89 ]]; then
+            echo "[h-run] ERROR: pearlminer_sm89 binary missing or not executable!"
+            ls -la /hive/miners/custom/pearlminer_sm89
+            exit 1
+          fi
           ARGS=$(cat miner.conf 2>/dev/null)
-          ./pearlminer_sm89 $ARGS 2>&1 | tee --append /var/log/miner/custom/custom.log
+          [[ -z "$ARGS" ]] && ARGS="--pool prl-ae.kryptex.network:7048 --stats-file /tmp/pearlminer_stats.json"
+          ./pearlminer_sm89 $ARGS
           EOF
 
           cat << 'EOF' > pearlminer_sm89/h-stats.sh
           #!/usr/bin/env bash
           STATS_FILE="/tmp/pearlminer_stats.json"
+          stats="null"
           if [[ -f "$STATS_FILE" ]]; then
-            stats=$(cat "$STATS_FILE")
-            khs=$(jq -r '.khs // 0' "$STATS_FILE")
-          else
-            stats="null"
-            khs=0
+            if command -v jq >/dev/null 2>&1; then
+              stats=$(jq -c . "$STATS_FILE" 2>/dev/null)
+            fi
+            if [[ -z "$stats" || "$stats" == "null" ]]; then
+              stats=$(cat "$STATS_FILE" | tr -d '\n')
+            fi
           fi
           echo "stats=$stats"
           EOF
 
           chmod +x pearlminer_sm89/h-config.sh pearlminer_sm89/h-run.sh pearlminer_sm89/h-stats.sh
-          tar -czvf pearlminer_sm89-4.1.tar.gz pearlminer_sm89/
+          tar -czvf pearlminer_sm89-4.2.tar.gz pearlminer_sm89/
 
       - name: Publish Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v4.1
-          name: "PearlMiner SM89 v4.1 (HiveOS & RTX 4070 Ti)"
-          files: pearlminer_sm89-4.1.tar.gz
+          tag_name: v4.2
+          name: "PearlMiner SM89 v4.2 (HiveOS & RTX 4070 Ti)"
+          files: pearlminer_sm89-4.2.tar.gz
