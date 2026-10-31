@@ -30,16 +30,15 @@ jobs:
             pearl_miner_sm89_ultimate.cu -o pearlminer_sm89/pearlminer_sm89 -lpthread -ldl
           chmod +x pearlminer_sm89/pearlminer_sm89
 
-      - name: Generate HiveOS Integration Scripts (h-manifest, h-config, h-run, h-stats)
+      - name: Generate HiveOS Integration Scripts (official custom-miner convention)
         run: |
           mkdir -p pearlminer_sm89
 
           cat << 'EOF' > pearlminer_sm89/h-manifest.conf
-          MINER_NAME=pearlminer_sm89
-          MINER_VER=4.2
-          MINER_VERSION=4.2
-          MINER_API_PORT=60050
-          CUSTOM_LOG_BASEDIR=/var/log/miner/custom
+          CUSTOM_NAME=pearlminer_sm89
+          CUSTOM_VERSION=4.3
+          CUSTOM_CONFIG_FILENAME=/hive/miners/custom/pearlminer_sm89/miner.conf
+          CUSTOM_LOG_BASENAME=/var/log/miner/custom/pearlminer_sm89
           EOF
 
           cat << 'EOF' > pearlminer_sm89/h-config.sh
@@ -61,27 +60,25 @@ jobs:
           ./pearlminer_sm89 $ARGS
           EOF
 
+          # Sourced by the HiveOS agent - MUST define $khs and $stats, do NOT echo output
           cat << 'EOF' > pearlminer_sm89/h-stats.sh
-          #!/usr/bin/env bash
-          STATS_FILE="/tmp/pearlminer_stats.json"
+          khs=0
           stats="null"
+          STATS_FILE="/tmp/pearlminer_stats.json"
           if [[ -f "$STATS_FILE" ]]; then
+            stats=$(cat "$STATS_FILE" | tr -d '\n')
             if command -v jq >/dev/null 2>&1; then
-              stats=$(jq -c . "$STATS_FILE" 2>/dev/null)
-            fi
-            if [[ -z "$stats" || "$stats" == "null" ]]; then
-              stats=$(cat "$STATS_FILE" | tr -d '\n')
+              khs=$(jq -r '.khs // 0' "$STATS_FILE" 2>/dev/null)
             fi
           fi
-          echo "stats=$stats"
           EOF
 
-          chmod +x pearlminer_sm89/h-config.sh pearlminer_sm89/h-run.sh pearlminer_sm89/h-stats.sh
-          tar -czvf pearlminer_sm89-4.2.tar.gz pearlminer_sm89/
+          chmod +x pearlminer_sm89/h-config.sh pearlminer_sm89/h-run.sh
+          tar -czvf pearlminer_sm89-4.3.tar.gz pearlminer_sm89/
 
       - name: Publish Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v4.2
-          name: "PearlMiner SM89 v4.2 (HiveOS & RTX 4070 Ti)"
-          files: pearlminer_sm89-4.2.tar.gz
+          tag_name: v4.3
+          name: "PearlMiner SM89 v4.3 (HiveOS & RTX 4070 Ti)"
+          files: pearlminer_sm89-4.3.tar.gz

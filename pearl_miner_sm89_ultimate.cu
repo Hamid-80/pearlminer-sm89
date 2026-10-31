@@ -1,6 +1,6 @@
-// ============================================================================
+﻿// ============================================================================
 // File: pearl_miner_sm89_ultimate.cu
-// Version: v4.2 Cross-Platform (HiveOS Linux + Windows x64)
+// Version: v4.3 Cross-Platform (HiveOS Linux + Windows x64)
 // Target GPU: NVIDIA GeForce RTX 4070 Ti (Ada Lovelace - sm_89)
 // Default Pool: prl.kryptex.network:7048
 // Default Wallet: prl1p6zx47507v0xp8389u7rggjy4wmy02eaa6x8atnhtux3lc89mwgrqmte6lh
@@ -565,7 +565,7 @@ private:
             }
             printf("[Stratum] Authenticating worker: %s\n", full_user.c_str());
 
-            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/4.2\"]}\n";
+            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/4.3\"]}\n";
             std::string auth_msg = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + full_user + "\",\"x\"]}\n";
             send(sock, sub_msg.c_str(), (int)sub_msg.size(), 0);
             send(sock, auth_msg.c_str(), (int)auth_msg.size(), 0);
@@ -760,7 +760,7 @@ int main(int argc, char* argv[]) {
     }
 
     printf("====================================================================\n");
-    printf("  PearlHash SM89 Ultimate v4.2 (HiveOS & Windows - RTX 4070 Ti)\n");
+    printf("  PearlHash SM89 Ultimate v4.3 (HiveOS & Windows - RTX 4070 Ti)\n");
     printf("  Pool Address  : %s:%d\n", pool_host.c_str(), pool_port);
     printf("  Wallet Address: %s\n", wallet.c_str());
     printf("====================================================================\n\n");
@@ -940,7 +940,7 @@ int main(int argc, char* argv[]) {
             write_hiveos_telemetry(stats_file, terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
                                    uptime, miner.get_accepted(), miner.get_rejected());
 
-            printf("[Speed v4.2] %.2f TH/s | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u\n",
+            printf("[Speed v4.3] %.2f TH/s | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u\n",
                    terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
                    miner.get_accepted(), miner.get_rejected());
             fflush(stdout);

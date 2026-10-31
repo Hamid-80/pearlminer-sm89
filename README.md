@@ -2,17 +2,29 @@
 
 Custom PearlHash (pearlhash) miner for HiveOS, built automatically with GitHub Actions on every push to `main`.
 
-**Download:** [pearlminer_sm89-4.2.tar.gz](https://github.com/Hamid-80/pearlminer-sm89/releases/download/v4.2/pearlminer_sm89-4.2.tar.gz)
+**Recommended:** use the SRBMiner flight sheet JSON below — SRBMiner-Multi has native `pearlhash` support and is pool-tested.
 
-## HiveOS Flight Sheet
+**Download custom miner:** [pearlminer_sm89-4.3.tar.gz](https://github.com/Hamid-80/pearlminer-sm89/releases/download/v4.3/pearlminer_sm89-4.3.tar.gz)
 
-- Miner: `Custom` → Miner name: `pearlminer_sm89`
-- Installation URL: the release `.tar.gz` link above
-- Hash algorithm: `pearlhash`
-- Template: `%WAL%.%WORKER_NAME%`
-- Pool: `prl.kryptex.network:7048`
+## Flight Sheets (JSON)
 
-## Ready-made Flight Sheet (JSON)
+| File | Miner | Notes |
+|---|---|---|
+| [`hiveos-flight-sheet.json`](hiveos-flight-sheet.json) | `srbminer_custom` (SRBMiner-Multi 3.8.2) | ✅ recommended, quick start |
+| [`hiveos-flight-sheet-custom-pearlminer_sm89.json`](hiveos-flight-sheet-custom-pearlminer_sm89.json) | custom `pearlminer_sm89` | this repo's own miner |
 
-Import the whole miner config in HiveOS via the `{...}` JSON editor in the Custom miner setup — see [`hiveos-flight-sheet.json`](hiveos-flight-sheet.json):
+Import via Flight Sheet → Miner → Custom → Setup Miner Config → JSON editor `{...}`.
 
+## HiveOS custom-miner conventions used
+
+Follows the official HiveOS custom miner integration docs:
+- `h-manifest.conf` with `CUSTOM_NAME`, `CUSTOM_VERSION`, `CUSTOM_CONFIG_FILENAME`, `CUSTOM_LOG_BASENAME`
+- `h-config.sh` generates `miner.conf`
+- `h-run.sh` launches the binary from `/hive/miners/custom/pearlminer_sm89`
+- `h-stats.sh` (sourced by the HiveOS agent) defines `$khs` and `$stats`
+- Archive name `pearlminer_sm89-<version>.tar.gz` and inner folder `pearlminer_sm89/`
+
+## Reference pool endpoints
+
+- Kryptex: `prl-ae.kryptex.network:7048`
+- Pearl Fortune (pool-tested for SRBMiner): `global.pearlfortune.org:8888`
