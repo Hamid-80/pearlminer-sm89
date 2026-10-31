@@ -26,7 +26,7 @@ jobs:
         run: |
           mkdir -p pearlminer_sm89
           nvcc -O3 -arch=sm_89 --use_fast_math -maxrregcount=96 -Xptxas="-v,-dlcm=ca" \
-            -static-libstdc++ -static-libgcc \
+            -Xcompiler="-static-libstdc++,-static-libgcc" \
             pearl_miner_sm89_ultimate.cu -o pearlminer_sm89/pearlminer_sm89 -lpthread -ldl
           chmod +x pearlminer_sm89/pearlminer_sm89
 
