@@ -11,3 +11,8 @@ Custom PearlHash (pearlhash) miner for HiveOS, built automatically with GitHub A
 - Hash algorithm: `pearlhash`
 - Template: `%WAL%.%WORKER_NAME%`
 - Pool: `prl.kryptex.network:7048`
+
+## Ready-made Flight Sheet (JSON)
+
+Import the whole miner config in HiveOS via the `{...}` JSON editor in the Custom miner setup — see [`hiveos-flight-sheet.json`](hiveos-flight-sheet.json):
+
