@@ -1,0 +1,76 @@
+name: Build HiveOS Custom Miner Package
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-hiveos:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install NVIDIA CUDA Toolkit 12.4
+        uses: Jimver/cuda-toolkit@v0.2.14
+        with:
+          cuda: '12.4.0'
+          sub-packages: '["nvcc", "cudart-dev"]'
+
+      - name: Compile PearlMiner SM89 for Linux/HiveOS
+        run: |
+          mkdir -p pearlminer_sm89
+          nvcc -O3 -arch=sm_89 --use_fast_math -maxrregcount=96 -Xptxas="-v,-dlcm=ca" \
+            pearl_miner_sm89_ultimate.cu -o pearlminer_sm89/pearlminer_sm89 -lpthread -ldl
+          chmod +x pearlminer_sm89/pearlminer_sm89
+
+      - name: Generate HiveOS Integration Scripts (h-manifest, h-config, h-run, h-stats)
+        run: |
+          mkdir -p pearlminer_sm89
+
+          cat << 'EOF' > pearlminer_sm89/h-manifest.conf
+          MINER_NAME=pearlminer_sm89
+          MINER_VERSION=4.1
+          MINER_API_PORT=60050
+          CUSTOM_LOG_BASEDIR=/var/log/miner/custom
+          EOF
+
+          cat << 'EOF' > pearlminer_sm89/h-config.sh
+          #!/usr/bin/env bash
+          conf="--pool ${CUSTOM_URL} --wallet ${CUSTOM_TEMPLATE} ${CUSTOM_USER_CONFIG}"
+          echo "$conf" > /hive/miners/custom/pearlminer_sm89/miner.conf
+          EOF
+
+          cat << 'EOF' > pearlminer_sm89/h-run.sh
+          #!/usr/bin/env bash
+          cd /hive/miners/custom/pearlminer_sm89
+          ARGS=$(cat miner.conf 2>/dev/null)
+          ./pearlminer_sm89 $ARGS 2>&1 | tee --append /var/log/miner/custom/custom.log
+          EOF
+
+          cat << 'EOF' > pearlminer_sm89/h-stats.sh
+          #!/usr/bin/env bash
+          STATS_FILE="/tmp/pearlminer_stats.json"
+          if [[ -f "$STATS_FILE" ]]; then
+            stats=$(cat "$STATS_FILE")
+            khs=$(jq -r '.khs // 0' "$STATS_FILE")
+          else
+            stats="null"
+            khs=0
+          fi
+          echo "stats=$stats"
+          EOF
+
+          chmod +x pearlminer_sm89/h-config.sh pearlminer_sm89/h-run.sh pearlminer_sm89/h-stats.sh
+          tar -czvf pearlminer_sm89-4.1.tar.gz pearlminer_sm89/
+
+      - name: Publish Release to GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v4.1
+          name: "PearlMiner SM89 v4.1 (HiveOS & RTX 4070 Ti)"
+          files: pearlminer_sm89-4.1.tar.gz

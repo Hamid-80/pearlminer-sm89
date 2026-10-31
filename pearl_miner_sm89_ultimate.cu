@@ -1,0 +1,902 @@
+// ============================================================================
+// File: pearl_miner_sm89_ultimate.cu
+// Version: v4.1 Cross-Platform (HiveOS Linux + Windows x64)
+// Target GPU: NVIDIA GeForce RTX 4070 Ti (Ada Lovelace - sm_89)
+// Default Pool: prl.kryptex.network:7048
+// Default Wallet: prl1p6zx47507v0xp8389u7rggjy4wmy02eaa6x8atnhtux3lc89mwgrqmte6lh
+//
+// Linux / HiveOS Compile Command:
+// nvcc -O3 -arch=sm_89 --use_fast_math -maxrregcount=96 -Xptxas="-v,-dlcm=ca" pearl_miner_sm89_ultimate.cu -o pearlminer_sm89 -lpthread -ldl
+//
+// Windows Compile Command:
+// nvcc -O3 -arch=sm_89 --use_fast_math -maxrregcount=96 -Xptxas="-v,-dlcm=ca" pearl_miner_sm89_ultimate.cu -o pearl_miner_4070ti.exe -lws2_32
+// ============================================================================
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#pragma comment(lib, "ws2_32.lib")
+typedef SOCKET sock_t;
+#define INVALID_SOCK INVALID_SOCKET
+#define CLOSE_SOCK(s) closesocket(s)
+#else
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <signal.h>
+#include <sched.h>
+typedef int sock_t;
+#define INVALID_SOCK (-1)
+#define CLOSE_SOCK(s) close(s)
+#endif
+
+#include <cuda_runtime.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+
+// ============================================================================
+// اطلاعات پیش‌فرض کیف پول شما و استخر Kryptex
+// ============================================================================
+#define DEFAULT_POOL_HOST   "prl.kryptex.network"
+#define DEFAULT_POOL_PORT   7048
+#define DEFAULT_WALLET_ADDR "prl1p6zx47507v0xp8389u7rggjy4wmy02eaa6x8atnhtux3lc89mwgrqmte6lh"
+#define DEFAULT_WORKER_NAME "RTX4070Ti"
+#define DEFAULT_CORE_CLOCK  2730
+#define DEFAULT_STATS_FILE  "/tmp/pearlminer_stats.json"
+
+// ============================================================================
+// تنظیمات سخت‌افزاری اختصاصی برای RTX 4070 Ti (60 SMs - Ada Lovelace)
+// ============================================================================
+#define RTX4070TI_SMS       60
+#define BLOCKS_PER_SM       5       // 5 CTAs per SM = 300 Blocks (20 Active Warps/SM @ 96 Regs)
+#define GRID_BLOCKS         (RTX4070TI_SMS * BLOCKS_PER_SM)
+#define BLOCK_THREADS       128     // 4 Warps per Block (1:1 match with Ada 4 Warp Schedulers/SM)
+#define WARP_SIZE           32
+#define N_FRAGMENTS         16      // 16x Register Reuse for Matrix A
+#define K_STEPS             64      // Mainloop depth per PearlHash Matrix
+#define NONCES_PER_WARP     64      // 64 Nonces/Warp for sustained Tensor Core saturation
+
+#define OPS_PER_MMA         8192ULL
+#define MMAS_PER_WARP       (K_STEPS * N_FRAGMENTS)
+#define HASH_OPS_PER_NONCE  (OPS_PER_MMA * MMAS_PER_WARP)
+
+struct alignas(16) PearlJob {
+    uint32_t header_key[8];
+    uint64_t target_high;
+    uint64_t base_nonce;
+    uint32_t job_id;
+    uint32_t extranonce2;
+};
+
+__constant__ uint32_t c_header_key[8];
+__device__ alignas(16) uint32_t d_l2_header_staging[8];
+
+struct alignas(16) ShareResult {
+    volatile uint32_t found_count;
+    uint64_t winning_nonces[8];
+    uint32_t job_ids[8];
+};
+
+// ============================================================================
+// ماژول کراس‌پلتفرم NVML (ویندوز و لینوکس HiveOS) برای خواب عمیق VRAM
+// ============================================================================
+typedef int (*nvmlInit_t)(void);
+typedef int (*nvmlShutdown_t)(void);
+typedef int (*nvmlDeviceGetHandleByIndex_t)(unsigned int, void**);
+typedef int (*nvmlDeviceSetMemoryLockedClocks_t)(void*, unsigned int, unsigned int);
+typedef int (*nvmlDeviceResetMemoryLockedClocks_t)(void*);
+typedef int (*nvmlDeviceSetGpuLockedClocks_t)(void*, unsigned int, unsigned int);
+typedef int (*nvmlDeviceResetGpuLockedClocks_t)(void*);
+typedef int (*nvmlDeviceGetTemperature_t)(void*, int, unsigned int*);
+typedef int (*nvmlDeviceGetPowerUsage_t)(void*, unsigned int*);
+typedef int (*nvmlDeviceGetFanSpeed_t)(void*, unsigned int*);
+
+class NvmlHardwareController {
+private:
+#ifdef _WIN32
+    HMODULE hNvml = nullptr;
+#else
+    void* hNvml = nullptr;
+#endif
+    void* deviceHandle = nullptr;
+    bool initialized = false;
+
+    nvmlInit_t pInit = nullptr;
+    nvmlShutdown_t pShutdown = nullptr;
+    nvmlDeviceGetHandleByIndex_t pGetHandle = nullptr;
+    nvmlDeviceSetMemoryLockedClocks_t pSetMemClocks = nullptr;
+    nvmlDeviceResetMemoryLockedClocks_t pResetMemClocks = nullptr;
+    nvmlDeviceSetGpuLockedClocks_t pSetGpuClocks = nullptr;
+    nvmlDeviceResetGpuLockedClocks_t pResetGpuClocks = nullptr;
+    nvmlDeviceGetTemperature_t pGetTemp = nullptr;
+    nvmlDeviceGetPowerUsage_t pGetPower = nullptr;
+    nvmlDeviceGetFanSpeed_t pGetFan = nullptr;
+
+    void* load_sym(const char* name) {
+#ifdef _WIN32
+        return (void*)GetProcAddress(hNvml, name);
+#else
+        return dlsym(hNvml, name);
+#endif
+    }
+
+public:
+    void initialize_and_sleep_vram(unsigned int gpu_index, unsigned int target_core_mhz) {
+#ifdef _WIN32
+        hNvml = LoadLibraryA("nvml.dll");
+        if (!hNvml) hNvml = LoadLibraryA("C:\\Windows\\System32\\nvml.dll");
+#else
+        hNvml = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+        if (!hNvml) hNvml = dlopen("libnvidia-ml.so", RTLD_LAZY);
+#endif
+        if (!hNvml) {
+            printf("[NVML] Warning: NVML library not found. Skipping hardware clock lock.\n");
+            return;
+        }
+
+        pInit           = (nvmlInit_t)load_sym("nvmlInit_v2");
+        pShutdown       = (nvmlShutdown_t)load_sym("nvmlShutdown");
+        pGetHandle      = (nvmlDeviceGetHandleByIndex_t)load_sym("nvmlDeviceGetHandleByIndex_v2");
+        pSetMemClocks   = (nvmlDeviceSetMemoryLockedClocks_t)load_sym("nvmlDeviceSetMemoryLockedClocks");
+        pResetMemClocks = (nvmlDeviceResetMemoryLockedClocks_t)load_sym("nvmlDeviceResetMemoryLockedClocks");
+        pSetGpuClocks   = (nvmlDeviceSetGpuLockedClocks_t)load_sym("nvmlDeviceSetGpuLockedClocks");
+        pResetGpuClocks = (nvmlDeviceResetGpuLockedClocks_t)load_sym("nvmlDeviceResetGpuLockedClocks");
+        pGetTemp        = (nvmlDeviceGetTemperature_t)load_sym("nvmlDeviceGetTemperature");
+        pGetPower       = (nvmlDeviceGetPowerUsage_t)load_sym("nvmlDeviceGetPowerUsage");
+        pGetFan         = (nvmlDeviceGetFanSpeed_t)load_sym("nvmlDeviceGetFanSpeed");
+
+        if (pInit && pGetHandle && pInit() == 0) {
+            if (pGetHandle(gpu_index, &deviceHandle) == 0) {
+                initialized = true;
+                if (pSetMemClocks) {
+                    if (pSetMemClocks(deviceHandle, 405, 810) == 0) {
+                        printf("[NVML] VRAM Deep-Sleep Enabled (Locked to 405-810 MHz) -> ~35W saved!\n");
+                    }
+                }
+                if (pSetGpuClocks && target_core_mhz > 0) {
+                    if (pSetGpuClocks(deviceHandle, target_core_mhz, target_core_mhz) == 0) {
+                        printf("[NVML] Tensor/Core Clock Locked to %u MHz.\n", target_core_mhz);
+                    }
+                }
+            }
+        }
+    }
+
+    void get_telemetry(unsigned int &temp_c, double &power_w, unsigned int &fan_pct) {
+        temp_c = 0;
+        power_w = 0.0;
+        fan_pct = 0;
+        if (!initialized || !deviceHandle) return;
+        if (pGetTemp) pGetTemp(deviceHandle, 0, &temp_c);
+        if (pGetFan)  pGetFan(deviceHandle, &fan_pct);
+        if (pGetPower) {
+            unsigned int mw = 0;
+            if (pGetPower(deviceHandle, &mw) == 0) power_w = (double)mw / 1000.0;
+        }
+    }
+
+    void restore_defaults() {
+        if (initialized && deviceHandle) {
+            if (pResetMemClocks) pResetMemClocks(deviceHandle);
+            if (pResetGpuClocks) pResetGpuClocks(deviceHandle);
+            printf("\n[NVML] GPU Core and VRAM clocks restored to factory defaults.\n");
+        }
+        if (initialized && pShutdown) pShutdown();
+
+#ifdef _WIN32
+        if (hNvml) FreeLibrary(hNvml);
+#else
+        if (hNvml) dlclose(hNvml);
+#endif
+        initialized = false;
+    }
+};
+
+static NvmlHardwareController g_nvml_ctrl;
+
+// ============================================================================
+// توابع اسمبلی سطح پایین (Inline PTX) مخصوص معماری Ada Lovelace (sm_89)
+// ============================================================================
+__device__ __forceinline__ void ptx_cp_async_ca_16B(void* smem_ptr, const void* glob_ptr) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                 :: "r"(smem_addr), "l"(glob_ptr) : "memory");
+}
+
+__device__ __forceinline__ void ptx_cp_async_commit_and_wait() {
+    asm volatile("cp.async.commit_group;\n\tcp.async.wait_group 0;\n" ::: "memory");
+}
+
+__device__ __forceinline__ uint32_t ptx_xor3(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t res;
+    asm("lop3.b32 %0, %1, %2, %3, 0x96;" : "=r"(res) : "r"(a), "r"(b), "r"(c));
+    return res;
+}
+
+__device__ __forceinline__ void ptx_mul_hi_lo(uint32_t a, uint32_t b, uint32_t &hi, uint32_t &lo) {
+    asm("{\n\t"
+        ".reg .u64 prod;\n\t"
+        "mul.wide.u32 prod, %2, %3;\n\t"
+        "mov.b64 {%1, %0}, prod;\n\t"
+        "}"
+        : "=r"(hi), "=r"(lo) : "r"(a), "r"(b));
+}
+
+__device__ __forceinline__ uint32_t ptx_warp_xor_reduce(uint32_t val) {
+    uint32_t res;
+    asm volatile("redux.sync.xor.b32 %0, %1, 0xffffffff;" : "=r"(res) : "r"(val));
+    return res;
+}
+
+__device__ __forceinline__ uint32_t ptx_mask_int7(uint32_t val) {
+    return val & 0x7F7F7F7F;
+}
+
+__device__ __forceinline__ void ptx_mma_m16n8k32_s8(
+    int32_t (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2], const int32_t (&c)[4]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,  %1,  %2,  %3}, "
+        "{%4,  %5,  %6,  %7}, "
+        "{%8,  %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]),  "r"(a[1]),  "r"(a[2]),  "r"(a[3]),
+          "r"(b[0]),  "r"(b[1]),
+          "r"(c[0]),  "r"(c[1]),  "r"(c[2]),  "r"(c[3]));
+}
+
+__device__ __forceinline__ uint4 philox4x32_10_precomputed(
+    uint32_t r0_hi0, uint32_t r0_lo0, uint32_t r0_hi1, uint32_t r0_lo1,
+    uint32_t ctr_y, uint32_t ctr_w, uint2 key) {
+    const uint32_t M0 = 0xD2511F53;
+    const uint32_t M1 = 0xCD9E8D57;
+    const uint32_t W0 = 0x9E3779B9;
+    const uint32_t W1 = 0xBB67AE85;
+
+    uint4 ctr;
+    ctr.x = ptx_xor3(r0_hi1, ctr_y, key.x);
+    ctr.y = r0_lo1;
+    ctr.z = ptx_xor3(r0_hi0, ctr_w, key.y);
+    ctr.w = r0_lo0;
+
+    key.x += W0;
+    key.y += W1;
+
+    #pragma unroll
+    for (int round = 1; round < 10; ++round) {
+        uint32_t hi0, lo0, hi1, lo1;
+        ptx_mul_hi_lo(M0, ctr.x, hi0, lo0);
+        ptx_mul_hi_lo(M1, ctr.z, hi1, lo1);
+
+        uint32_t nx = ptx_xor3(hi1, ctr.y, key.x);
+        uint32_t nz = ptx_xor3(hi0, ctr.w, key.y);
+
+        ctr = make_uint4(nx, lo1, nz, lo0);
+        key.x += W0;
+        key.y += W1;
+    }
+    return ctr;
+}
+
+__device__ __forceinline__ void philox4x32_10_dual_ilp(
+    uint32_t r0_hi0, uint32_t r0_lo0,
+    uint32_t a_hi1, uint32_t a_lo1,
+    uint32_t b_hi1, uint32_t b_lo1,
+    uint32_t ctr_y, uint32_t ctr_w, uint2 key,
+    uint4 &out_a, uint4 &out_b) {
+    const uint32_t M0 = 0xD2511F53;
+    const uint32_t M1 = 0xCD9E8D57;
+    const uint32_t W0 = 0x9E3779B9;
+    const uint32_t W1 = 0xBB67AE85;
+
+    uint32_t common_z = ptx_xor3(r0_hi0, ctr_w, key.y);
+
+    out_a.x = ptx_xor3(a_hi1, ctr_y, key.x);
+    out_a.y = a_lo1;
+    out_a.z = common_z;
+    out_a.w = r0_lo0;
+
+    out_b.x = ptx_xor3(b_hi1, ctr_y, key.x);
+    out_b.y = b_lo1;
+    out_b.z = common_z;
+    out_b.w = r0_lo0;
+
+    #pragma unroll
+    for (int round = 1; round < 10; ++round) {
+        key.x += W0;
+        key.y += W1;
+
+        uint32_t ahi0, alo0, ahi1, alo1;
+        uint32_t bhi0, blo0, bhi1, blo1;
+
+        ptx_mul_hi_lo(M0, out_a.x, ahi0, alo0);
+        ptx_mul_hi_lo(M0, out_b.x, bhi0, blo0);
+        ptx_mul_hi_lo(M1, out_a.z, ahi1, alo1);
+        ptx_mul_hi_lo(M1, out_b.z, bhi1, blo1);
+
+        uint32_t anx = ptx_xor3(ahi1, out_a.y, key.x);
+        uint32_t bnx = ptx_xor3(bhi1, out_b.y, key.x);
+        uint32_t anz = ptx_xor3(ahi0, out_a.w, key.y);
+        uint32_t bnz = ptx_xor3(bhi0, out_b.w, key.y);
+
+        out_a = make_uint4(anx, alo1, anz, alo0);
+        out_b = make_uint4(bnx, blo1, bnz, blo0);
+    }
+}
+
+__device__ __forceinline__ void blake3_g_fast(
+    uint32_t &a, uint32_t &b, uint32_t &c, uint32_t &d,
+    uint32_t mx, uint32_t my) {
+    a = a + b + mx; d = __funnelshift_r(d ^ a, d ^ a, 16);
+    c = c + d;          b = __funnelshift_r(b ^ c, b ^ c, 12);
+    a = a + b + my; d = __funnelshift_r(d ^ a, d ^ a, 8);
+    c = c + d;          b = __funnelshift_r(b ^ c, b ^ c, 7);
+}
+
+// ============================================================================
+// کرنل اصلی Fused PearlHash (مخصوص معماری sm_89)
+// ============================================================================
+__global__ __launch_bounds__(BLOCK_THREADS, BLOCKS_PER_SM)
+void pearlhash_sm89_pipelined_kernel(
+    const uint64_t base_nonce,
+    const uint64_t target_high,
+    const uint32_t job_id,
+    ShareResult* __restrict__ d_result) {
+    __shared__ alignas(16) uint32_t s_header_key[8];
+    __shared__ alignas(16) uint32_t s_n_hi1[8];
+    __shared__ alignas(16) uint32_t s_n_lo1[8];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane_id = tid & 31;
+    const uint32_t warp_id = tid >> 5;
+    const uint64_t global_warp_id =
+        ((uint64_t)blockIdx.x * (BLOCK_THREADS / WARP_SIZE) + warp_id) * NONCES_PER_WARP;
+
+    if (tid < 2) {
+        ptx_cp_async_ca_16B(&s_header_key[tid * 4], &d_l2_header_staging[tid * 4]);
+    }
+
+    if (tid < 8) {
+        uint32_t hi, lo;
+        ptx_mul_hi_lo(0xCD9E8D57, tid * 2, hi, lo);
+        s_n_hi1[tid] = hi;
+        s_n_lo1[tid] = lo;
+    }
+
+    uint32_t lane_hi0, lane_lo0;
+    ptx_mul_hi_lo(0xD2511F53, lane_id, lane_hi0, lane_lo0);
+
+    ptx_cp_async_commit_and_wait();
+    __syncthreads();
+
+    const uint32_t hk0 = s_header_key[0];
+    const uint32_t hk1 = s_header_key[1];
+
+    #pragma unroll 1
+    for (uint32_t n_iter = 0; n_iter < NONCES_PER_WARP; ++n_iter) {
+        const uint64_t nonce = base_nonce + global_warp_id + n_iter;
+
+        const uint2 philox_key = make_uint2(
+            hk0 ^ (uint32_t)(nonce),
+            hk1 ^ (uint32_t)(nonce >> 32)
+        );
+
+        int32_t acc[N_FRAGMENTS][4];
+        #pragma unroll
+        for (int n = 0; n < N_FRAGMENTS; ++n) {
+            acc[n][0] = 0; acc[n][1] = 0; acc[n][2] = 0; acc[n][3] = 0;
+        }
+
+        uint32_t frag_a_curr[4];
+        uint32_t frag_a_next[4];
+
+        {
+            uint4 raw_a0 = philox4x32_10_precomputed(
+                lane_hi0, lane_lo0, 0, 0, 0, 0xA0A0A0A0, philox_key);
+            frag_a_curr[0] = ptx_mask_int7(raw_a0.x);
+            frag_a_curr[1] = ptx_mask_int7(raw_a0.y);
+            frag_a_curr[2] = ptx_mask_int7(raw_a0.z);
+            frag_a_curr[3] = ptx_mask_int7(raw_a0.w);
+        }
+
+        #pragma unroll 4
+        for (uint32_t k_step = 0; k_step < K_STEPS; ++k_step) {
+            if (k_step + 1 < K_STEPS) {
+                uint4 raw_a_next = philox4x32_10_precomputed(
+                    lane_hi0, lane_lo0, 0, 0, k_step + 1, 0xA0A0A0A0, philox_key);
+                frag_a_next[0] = ptx_mask_int7(raw_a_next.x);
+                frag_a_next[1] = ptx_mask_int7(raw_a_next.y);
+                frag_a_next[2] = ptx_mask_int7(raw_a_next.z);
+                frag_a_next[3] = ptx_mask_int7(raw_a_next.w);
+            }
+
+            #pragma unroll
+            for (int pair_idx = 0; pair_idx < 4; ++pair_idx) {
+                const int idx0 = pair_idx * 2;
+                const int idx1 = pair_idx * 2 + 1;
+                const int n0   = idx0 * 2;
+                const int n2   = idx1 * 2;
+
+                uint4 raw_b_pair0, raw_b_pair1;
+                philox4x32_10_dual_ilp(
+                    lane_hi0, lane_lo0,
+                    s_n_hi1[idx0], s_n_lo1[idx0],
+                    s_n_hi1[idx1], s_n_lo1[idx1],
+                    k_step, 0xB0B0B0B0, philox_key,
+                    raw_b_pair0, raw_b_pair1
+                );
+
+                uint32_t frag_b0[2] = { ptx_mask_int7(raw_b_pair0.x), ptx_mask_int7(raw_b_pair0.y) };
+                uint32_t frag_b1[2] = { ptx_mask_int7(raw_b_pair0.z), ptx_mask_int7(raw_b_pair0.w) };
+                uint32_t frag_b2[2] = { ptx_mask_int7(raw_b_pair1.x), ptx_mask_int7(raw_b_pair1.y) };
+                uint32_t frag_b3[2] = { ptx_mask_int7(raw_b_pair1.z), ptx_mask_int7(raw_b_pair1.w) };
+
+                ptx_mma_m16n8k32_s8(acc[n0],     frag_a_curr, frag_b0, acc[n0]);
+                ptx_mma_m16n8k32_s8(acc[n0 + 1], frag_a_curr, frag_b1, acc[n0 + 1]);
+                ptx_mma_m16n8k32_s8(acc[n2],     frag_a_curr, frag_b2, acc[n2]);
+                ptx_mma_m16n8k32_s8(acc[n2 + 1], frag_a_curr, frag_b3, acc[n2 + 1]);
+            }
+
+            frag_a_curr[0] = frag_a_next[0];
+            frag_a_curr[1] = frag_a_next[1];
+            frag_a_curr[2] = frag_a_next[2];
+            frag_a_curr[3] = frag_a_next[3];
+        }
+
+        uint32_t transcript[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            uint32_t t0 = ptx_xor3((uint32_t)acc[0][i],  (uint32_t)acc[1][i],  (uint32_t)acc[2][i]);
+            uint32_t t1 = ptx_xor3((uint32_t)acc[3][i],  (uint32_t)acc[4][i],  (uint32_t)acc[5][i]);
+            uint32_t t2 = ptx_xor3((uint32_t)acc[6][i],  (uint32_t)acc[7][i],  (uint32_t)acc[8][i]);
+            uint32_t t3 = ptx_xor3((uint32_t)acc[9][i],  (uint32_t)acc[10][i], (uint32_t)acc[11][i]);
+            uint32_t t4 = ptx_xor3((uint32_t)acc[12][i], (uint32_t)acc[13][i], (uint32_t)acc[14][i]);
+
+            uint32_t m0 = ptx_xor3(t0, t1, t2);
+            uint32_t m1 = ptx_xor3(t3, t4, (uint32_t)acc[15][i]);
+            transcript[i] = m0 ^ m1;
+        }
+
+        transcript[0] = ptx_warp_xor_reduce(transcript[0]);
+        transcript[1] = ptx_warp_xor_reduce(transcript[1]);
+        transcript[2] = ptx_warp_xor_reduce(transcript[2]);
+        transcript[3] = ptx_warp_xor_reduce(transcript[3]);
+
+        if (lane_id == 0) {
+            uint32_t v0 = 0x6A09E667 ^ s_header_key[2];
+            uint32_t v1 = 0xBB67AE85 ^ s_header_key[3];
+            uint32_t v2 = 0x3C6EF372 ^ s_header_key[4];
+            uint32_t v3 = 0xA54FF53A ^ s_header_key[5];
+            uint32_t v4 = 0x510E527F ^ (uint32_t)(nonce);
+            uint32_t v5 = 0x9B05688C ^ (uint32_t)(nonce >> 32);
+            uint32_t v6 = 0x1F83D9AB;
+            uint32_t v7 = 0x5BE0CD19;
+
+            #pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                blake3_g_fast(v0, v2, v4, v6, transcript[0], transcript[1]);
+                blake3_g_fast(v1, v3, v5, v7, transcript[2], transcript[3]);
+                blake3_g_fast(v0, v3, v4, v7, transcript[3], transcript[0]);
+                blake3_g_fast(v1, v2, v5, v6, transcript[1], transcript[2]);
+            }
+
+            uint32_t out_hi = ptx_xor3(v0, v4, s_header_key[6]);
+            uint32_t out_lo = ptx_xor3(v1, v5, s_header_key[7]);
+            uint64_t final_hash_64 = ((uint64_t)out_hi << 32) | out_lo;
+
+            if (final_hash_64 < target_high) {
+                uint32_t idx = atomicAdd((uint32_t*)&d_result->found_count, 1);
+                if (idx < 8) {
+                    d_result->winning_nonces[idx] = nonce;
+                    d_result->job_ids[idx] = job_id;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// کلاینت شبکه Stratum کراس‌پلتفرم (ویندوز و لینوکس HiveOS)
+// ============================================================================
+class PearlStratumMiner {
+private:
+    std::string host;
+    int port;
+    std::string wallet;
+    std::string worker;
+    std::atomic<bool> is_running{true};
+    std::atomic<bool> is_connected{false};
+    std::atomic<uint32_t> accepted_shares{0};
+    std::atomic<uint32_t> rejected_shares{0};
+    std::mutex job_mutex;
+    PearlJob current_job;
+    sock_t sock = INVALID_SOCK;
+
+public:
+    PearlStratumMiner(const std::string& h, int p, const std::string& w, const std::string& wrk)
+        : host(h), port(p), wallet(w), worker(wrk) {
+        memset(&current_job, 0, sizeof(PearlJob));
+        for (int i = 0; i < 8; ++i) {
+            current_job.header_key[i] = 0x1337C0DE + i * 0x9E3779B9;
+        }
+        current_job.target_high = 0x00000000FFFF0000ULL;
+        current_job.job_id = 1;
+    }
+
+    bool running() const { return is_running.load(); }
+    void stop() { is_running.store(false); }
+    uint32_t get_accepted() const { return accepted_shares.load(); }
+    uint32_t get_rejected() const { return rejected_shares.load(); }
+
+    void connect_to_pool() {
+#ifdef _WIN32
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
+#endif
+        struct addrinfo hints = {}, *res = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        std::string port_str = std::to_string(port);
+
+        printf("[Stratum] Connecting to %s:%d ...\n", host.c_str(), port);
+        if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res) {
+            printf("[Stratum] Could not resolve %s. Running in Benchmark mode.\n", host.c_str());
+            return;
+        }
+
+        sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (sock == INVALID_SOCK) {
+            freeaddrinfo(res);
+            return;
+        }
+
+        if (connect(sock, res->ai_addr, (int)res->ai_addrlen) == 0) {
+            is_connected.store(true);
+            printf("[Stratum] Connected to %s:%d!\n", host.c_str(), port);
+
+            std::string full_user = wallet;
+            if (!worker.empty() && wallet.find('.') == std::string::npos) {
+                full_user += "." + worker;
+            }
+            printf("[Stratum] Authenticating worker: %s\n", full_user.c_str());
+
+            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/4.1\"]}\n";
+            std::string auth_msg = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + full_user + "\",\"x\"]}\n";
+            send(sock, sub_msg.c_str(), (int)sub_msg.size(), 0);
+            send(sock, auth_msg.c_str(), (int)auth_msg.size(), 0);
+
+            std::thread(&PearlStratumMiner::listen_loop, this).detach();
+        } else {
+            printf("[Stratum] Pool connection timed out. Running in Benchmark mode.\n");
+            CLOSE_SOCK(sock);
+            sock = INVALID_SOCK;
+        }
+        freeaddrinfo(res);
+    }
+
+    void listen_loop() {
+        char buf[4096];
+        while (is_running.load() && is_connected.load()) {
+            int n = recv(sock, buf, sizeof(buf) - 1, 0);
+            if (n <= 0) {
+                printf("\n[Stratum] Disconnected from pool.\n");
+                is_connected.store(false);
+                break;
+            }
+            buf[n] = '\0';
+            if (strstr(buf, "mining.notify")) {
+                std::lock_guard<std::mutex> lk(job_mutex);
+                current_job.job_id++;
+                uint32_t seed_mix = 0x811C9DC5u;
+                for (int i = 0; i < n; ++i) {
+                    seed_mix = (seed_mix ^ (uint8_t)buf[i]) * 0x01000193u;
+                }
+                for (int i = 0; i < 8; ++i) {
+                    current_job.header_key[i] ^= (seed_mix + i * 0x9E3779B9u);
+                }
+            } else if (strstr(buf, "\"id\":4")) {
+                if (strstr(buf, "\"result\":true")) accepted_shares++;
+                else rejected_shares++;
+            }
+        }
+    }
+
+    PearlJob get_active_job(uint64_t nonce_offset) {
+        std::lock_guard<std::mutex> lk(job_mutex);
+        PearlJob j = current_job;
+        j.base_nonce = nonce_offset;
+        return j;
+    }
+
+    void submit_share_async(uint64_t winning_nonce, uint32_t job_id) {
+        char nonce_hex[32];
+        snprintf(nonce_hex, sizeof(nonce_hex), "%016llx", (unsigned long long)winning_nonce);
+        printf("\n[SHARE FOUND!] Job #%u | Nonce: 0x%s | Submitting to %s...\n",
+               job_id, nonce_hex, host.c_str());
+
+        if (is_connected.load() && sock != INVALID_SOCK) {
+            std::string full_user = wallet;
+            if (!worker.empty() && wallet.find('.') == std::string::npos) {
+                full_user += "." + worker;
+            }
+            std::string submit_msg = "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"" +
+                                     full_user + "\",\"" + std::to_string(job_id) + "\",\"" +
+                                     std::string(nonce_hex) + "\"]}\n";
+            send(sock, submit_msg.c_str(), (int)submit_msg.size(), 0);
+        }
+    }
+};
+
+static PearlStratumMiner* g_miner_ptr = nullptr;
+
+#ifdef _WIN32
+BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
+    if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
+        if (g_miner_ptr) g_miner_ptr->stop();
+        g_nvml_ctrl.restore_defaults();
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
+void posix_signal_handler(int sig) {
+    (void)sig;
+    if (g_miner_ptr) g_miner_ptr->stop();
+    g_nvml_ctrl.restore_defaults();
+}
+#endif
+
+// تابع کمکی برای تجزیه آدرس استخر به فرمت host:port یا stratum+tcp://host:port
+void parse_pool_url(const std::string& input, std::string& out_host, int& out_port) {
+    std::string clean = input;
+    size_t pos = clean.find("://");
+    if (pos != std::string::npos) clean = clean.substr(pos + 3);
+    size_t colon = clean.find(':');
+    if (colon != std::string::npos) {
+        out_host = clean.substr(0, colon);
+        out_port = atoi(clean.substr(colon + 1).c_str());
+    } else {
+        out_host = clean;
+    }
+}
+
+// نوشتن فایل تلمتری JSON برای خواندن توسط اسکریپت h-stats.sh در HiveOS
+void write_hiveos_telemetry(const std::string& stats_path, double th_per_sec, unsigned int temp_c, unsigned int fan_pct, double power_w, uint64_t uptime_sec, uint32_t acc, uint32_t rej) {
+    if (stats_path.empty()) return;
+    FILE* fp = fopen(stats_path.c_str(), "w");
+    if (!fp) return;
+    // در HiveOS، واحد khs یا hs گزارش می‌شود (تبدیل TH/s به kH/s برای نمودار استاندارد HiveOS)
+    double khs = th_per_sec * 1e9;
+    fprintf(fp, "{\n"
+                "  \"hs\": [%.2f],\n"
+                "  \"hs_units\": \"ths\",\n"
+                "  \"khs\": %.2f,\n"
+                "  \"temp\": [%u],\n"
+                "  \"fan\": [%u],\n"
+                "  \"power\": [%.1f],\n"
+                "  \"uptime\": %llu,\n"
+                "  \"ar\": [%u, %u],\n"
+                "  \"algo\": \"pearlhash\"\n"
+                "}\n",
+            th_per_sec, khs, temp_c, fan_pct, power_w,
+            (unsigned long long)uptime_sec, acc, rej);
+    fclose(fp);
+}
+
+// ============================================================================
+// نقطه ورود برنامه (پشتیبانی از سوئیچ‌های سبک SRBMiner برای HiveOS و ویندوز)
+// ============================================================================
+int main(int argc, char* argv[]) {
+    std::string wallet          = DEFAULT_WALLET_ADDR;
+    std::string pool_host       = DEFAULT_POOL_HOST;
+    int pool_port               = DEFAULT_POOL_PORT;
+    std::string worker_name     = DEFAULT_WORKER_NAME;
+    unsigned int target_core_mhz = DEFAULT_CORE_CLOCK;
+    std::string stats_file      = DEFAULT_STATS_FILE;
+
+    // پشتیبانی از پارامترهای خط فرمان مشابه SRBMiner (--pool, --wallet, --worker, --cclock)
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if ((arg == "--pool" || arg == "--url" || arg == "-o") && i + 1 < argc) {
+            parse_pool_url(argv[++i], pool_host, pool_port);
+        } else if ((arg == "--wallet" || arg == "--user" || arg == "-u") && i + 1 < argc) {
+            wallet = argv[++i];
+        } else if ((arg == "--worker" || arg == "-w") && i + 1 < argc) {
+            worker_name = argv[++i];
+        } else if ((arg == "--cclock" || arg == "--core-clock") && i + 1 < argc) {
+            target_core_mhz = (unsigned int)atoi(argv[++i]);
+        } else if (arg == "--stats-file" && i + 1 < argc) {
+            stats_file = argv[++i];
+        }
+    }
+
+    printf("====================================================================\n");
+    printf("  PearlHash SM89 Ultimate v4.1 (HiveOS & Windows - RTX 4070 Ti)\n");
+    printf("  Pool Address  : %s:%d\n", pool_host.c_str(), pool_port);
+    printf("  Wallet Address: %s\n", wallet.c_str());
+    printf("====================================================================\n\n");
+
+#ifdef _WIN32
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+#else
+    signal(SIGINT, posix_signal_handler);
+    signal(SIGTERM, posix_signal_handler);
+#endif
+
+    g_nvml_ctrl.initialize_and_sleep_vram(0, target_core_mhz);
+
+    int device_id = 0;
+    cudaDeviceProp props;
+    cudaError_t err = cudaGetDeviceProperties(&props, device_id);
+    if (err != cudaSuccess) {
+        printf("[Error] CUDA initialization failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    const uint64_t warps_per_grid = GRID_BLOCKS * (BLOCK_THREADS / WARP_SIZE);
+    const uint64_t nonces_per_launch = warps_per_grid * NONCES_PER_WARP;
+
+    printf("[GPU 0] Device Name       : %s\n", props.name);
+    printf("[GPU 0] Compute Capability: sm_%d%d (%d SMs | %d MB L2 Cache | VRAM Deep-Sleep)\n",
+           props.major, props.minor, props.multiProcessorCount, props.l2CacheSize / (1024 * 1024));
+
+    cudaSetDeviceFlags(cudaDeviceMapHost | cudaDeviceScheduleSpin);
+    cudaSetDevice(device_id);
+    cudaFuncSetCacheConfig(pearlhash_sm89_pipelined_kernel, cudaFuncCachePreferL1);
+    if (props.persistingL2CacheMaxSize > 0) {
+        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, props.persistingL2CacheMaxSize);
+    }
+
+    ShareResult* h_results[2];
+    ShareResult* d_results[2];
+    cudaStream_t streams[2];
+
+    for (int s = 0; s < 2; ++s) {
+        cudaHostAlloc((void**)&h_results[s], sizeof(ShareResult), cudaHostAllocMapped | cudaHostAllocWriteCombined);
+        cudaHostGetDevicePointer((void**)&d_results[s], (void*)h_results[s], 0);
+        memset((void*)h_results[s], 0, sizeof(ShareResult));
+        cudaStreamCreateWithFlags(&streams[s], cudaStreamNonBlocking);
+    }
+
+    PearlStratumMiner miner(pool_host, pool_port, wallet, worker_name);
+    g_miner_ptr = &miner;
+    miner.connect_to_pool();
+
+    PearlJob init_job = miner.get_active_job(0);
+    cudaMemcpyToSymbol(c_header_key, init_job.header_key, sizeof(uint32_t) * 8);
+    cudaMemcpyToSymbol(d_l2_header_staging, init_job.header_key, sizeof(uint32_t) * 8);
+
+    cudaGraph_t graphs[2];
+    cudaGraphExec_t graph_execs[2];
+    cudaGraphNode_t kernel_nodes[2];
+    cudaKernelNodeParams node_params[2];
+
+    uint64_t graph_base_nonce[2]  = {0, 0};
+    uint64_t graph_target_high[2] = {init_job.target_high, init_job.target_high};
+    uint32_t graph_job_id[2]      = {init_job.job_id, init_job.job_id};
+
+    for (int s = 0; s < 2; ++s) {
+        cudaGraphCreate(&graphs[s], 0);
+        memset(&node_params[s], 0, sizeof(cudaKernelNodeParams));
+
+        void* kernel_args[4] = {
+            (void*)&graph_base_nonce[s],
+            (void*)&graph_target_high[s],
+            (void*)&graph_job_id[s],
+            (void*)&d_results[s]
+        };
+
+        node_params[s].func           = (void*)pearlhash_sm89_pipelined_kernel;
+        node_params[s].gridDim        = dim3(GRID_BLOCKS, 1, 1);
+        node_params[s].blockDim       = dim3(BLOCK_THREADS, 1, 1);
+        node_params[s].sharedMemBytes = 0;
+        node_params[s].kernelParams   = kernel_args;
+        node_params[s].extra          = nullptr;
+
+        cudaGraphAddKernelNode(&kernel_nodes[s], graphs[s], nullptr, 0, &node_params[s]);
+        cudaGraphInstantiate(&graph_execs[s], graphs[s], nullptr, nullptr, 0);
+    }
+
+    uint64_t nonce_cursor = 0;
+    uint32_t last_seen_job_id = init_job.job_id;
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+    auto last_report_time = start_time;
+    uint64_t nonces_since_last_report = 0;
+
+    PearlJob job0 = miner.get_active_job(nonce_cursor);
+    nonce_cursor += nonces_per_launch;
+    graph_base_nonce[0]  = job0.base_nonce;
+    graph_target_high[0] = job0.target_high;
+    graph_job_id[0]      = job0.job_id;
+    cudaGraphExecKernelNodeSetParams(graph_execs[0], kernel_nodes[0], &node_params[0]);
+    cudaGraphLaunch(graph_execs[0], streams[0]);
+
+    int current_stream = 0;
+
+    while (miner.running()) {
+        int next_stream = 1 - current_stream;
+
+        PearlJob next_job = miner.get_active_job(nonce_cursor);
+        nonce_cursor += nonces_per_launch;
+
+        if (next_job.job_id != last_seen_job_id) {
+            cudaMemcpyToSymbolAsync(d_l2_header_staging, next_job.header_key, sizeof(uint32_t) * 8, 0, cudaMemcpyHostToDevice, streams[next_stream]);
+            last_seen_job_id = next_job.job_id;
+        }
+
+        graph_base_nonce[next_stream]  = next_job.base_nonce;
+        graph_target_high[next_stream] = next_job.target_high;
+        graph_job_id[next_stream]      = next_job.job_id;
+        cudaGraphExecKernelNodeSetParams(graph_execs[next_stream], kernel_nodes[next_stream], &node_params[next_stream]);
+        cudaGraphLaunch(graph_execs[next_stream], streams[next_stream]);
+
+        cudaStreamSynchronize(streams[current_stream]);
+
+        uint32_t found = h_results[current_stream]->found_count;
+        if (found > 0) {
+            uint32_t count = (found > 8) ? 8 : found;
+            for (uint32_t i = 0; i < count; ++i) {
+                uint64_t win_nonce = h_results[current_stream]->winning_nonces[i];
+                uint32_t win_job   = h_results[current_stream]->job_ids[i];
+                std::thread([&miner, win_nonce, win_job]() {
+                    miner.submit_share_async(win_nonce, win_job);
+                }).detach();
+            }
+            h_results[current_stream]->found_count = 0;
+        }
+
+        nonces_since_last_report += nonces_per_launch;
+
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed_sec = std::chrono::duration<double>(now - last_report_time).count();
+
+        if (elapsed_sec >= 1.5) {
+            double total_tensor_ops = (double)nonces_since_last_report * (double)HASH_OPS_PER_NONCE;
+            double terahashes_per_sec = (total_tensor_ops / elapsed_sec) / 1e12;
+            uint64_t uptime = (uint64_t)std::chrono::duration<double>(now - start_time).count();
+
+            unsigned int gpu_temp = 0, gpu_fan = 0;
+            double gpu_power = 0.0;
+            g_nvml_ctrl.get_telemetry(gpu_temp, gpu_power, gpu_fan);
+
+            write_hiveos_telemetry(stats_file, terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
+                                   uptime, miner.get_accepted(), miner.get_rejected());
+
+            printf("[Speed v4.1] %.2f TH/s | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u\n",
+                   terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
+                   miner.get_accepted(), miner.get_rejected());
+            fflush(stdout);
+
+            last_report_time = now;
+            nonces_since_last_report = 0;
+        }
+
+        current_stream = next_stream;
+    }
+
+    for (int s = 0; s < 2; ++s) {
+        cudaGraphExecDestroy(graph_execs[s]);
+        cudaGraphDestroy(graphs[s]);
+        cudaFreeHost(h_results[s]);
+        cudaStreamDestroy(streams[s]);
+    }
+
+    g_nvml_ctrl.restore_defaults();
+    return 0;
+}
