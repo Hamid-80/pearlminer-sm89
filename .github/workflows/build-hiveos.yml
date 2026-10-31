@@ -22,13 +22,22 @@ jobs:
           method: 'network'
           sub-packages: '["nvcc", "cudart-dev"]'
 
-      - name: Compile PearlMiner SM89 for Linux/HiveOS
+      - name: Compile PearlMiner SM89 (main + lite presets)
         run: |
           mkdir -p pearlminer_sm89
-          nvcc -O3 -arch=sm_89 --use_fast_math -maxrregcount=96 -Xptxas="-v,-dlcm=ca" \
-            -Xcompiler="-static-libstdc++,-static-libgcc" \
-            pearl_miner_sm89_ultimate.cu -o pearlminer_sm89/pearlminer_sm89 -lpthread -ldl
-          chmod +x pearlminer_sm89/pearlminer_sm89
+          COMMON="-O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca"
+          LINK="-Xcompiler=-static-libstdc++,-static-libgcc -lpthread -ldl"
+
+          echo "=== main preset (16 fragments / 5 blocks per SM) ==="
+          nvcc $COMMON -Xptxas=-v -DN_FRAGMENTS=16 -DBLOCKS_PER_SM=5 \
+            pearl_miner_sm89_ultimate.cu -o pearlminer_sm89/pearlminer_sm89 $LINK
+
+          echo "=== lite preset (8 fragments / 8 blocks per SM) ==="
+          nvcc $COMMON -Xptxas=-v -DN_FRAGMENTS=8 -DBLOCKS_PER_SM=8 \
+            pearl_miner_sm89_ultimate.cu -o pearlminer_sm89/pearlminer_sm89_lite $LINK
+
+          chmod +x pearlminer_sm89/pearlminer_sm89 pearlminer_sm89/pearlminer_sm89_lite
+          ls -la pearlminer_sm89/
 
       - name: Generate HiveOS Integration Scripts (official custom-miner convention)
         run: |
@@ -36,7 +45,7 @@ jobs:
 
           cat << 'EOF' > pearlminer_sm89/h-manifest.conf
           CUSTOM_NAME=pearlminer_sm89
-          CUSTOM_VERSION=4.3
+          CUSTOM_VERSION=4.4
           CUSTOM_CONFIG_FILENAME=/hive/miners/custom/pearlminer_sm89/miner.conf
           CUSTOM_LOG_BASENAME=/var/log/miner/custom/pearlminer_sm89
           EOF
@@ -50,14 +59,22 @@ jobs:
           cat << 'EOF' > pearlminer_sm89/h-run.sh
           #!/usr/bin/env bash
           cd /hive/miners/custom/pearlminer_sm89 || exit 1
-          if [[ ! -x ./pearlminer_sm89 ]]; then
+          BIN=./pearlminer_sm89
+          if [[ ! -x $BIN ]]; then
             echo "[h-run] ERROR: pearlminer_sm89 binary missing or not executable!"
             ls -la /hive/miners/custom/pearlminer_sm89
             exit 1
           fi
           ARGS=$(cat miner.conf 2>/dev/null)
-          [[ -z "$ARGS" ]] && ARGS="--pool prl-ae.kryptex.network:7048 --stats-file /tmp/pearlminer_stats.json"
-          ./pearlminer_sm89 $ARGS
+          [[ -z "$ARGS" ]] && ARGS="--pool prl-ae.kryptex.network:7048"
+          # --preset lite switches to the low-register/high-occupancy kernel (benchmark both on your rig)
+          if [[ "$ARGS" == *"--preset lite"* ]]; then
+            BIN=./pearlminer_sm89_lite
+            ARGS=${ARGS//--preset lite/}
+          else
+            ARGS=${ARGS//--preset main/}
+          fi
+          exec $BIN $ARGS
           EOF
 
           # Sourced by the HiveOS agent - MUST define $khs and $stats, do NOT echo output
@@ -74,11 +91,21 @@ jobs:
           EOF
 
           chmod +x pearlminer_sm89/h-config.sh pearlminer_sm89/h-run.sh
-          tar -czvf pearlminer_sm89-4.3.tar.gz pearlminer_sm89/
+          tar -czvf pearlminer_sm89-4.4.tar.gz pearlminer_sm89/
 
       - name: Publish Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v4.3
-          name: "PearlMiner SM89 v4.3 (HiveOS & RTX 4070 Ti)"
-          files: pearlminer_sm89-4.3.tar.gz
+          tag_name: v4.4
+          name: "PearlMiner SM89 v4.4 (HiveOS & RTX 4070 Ti)"
+          body: |
+            ## v4.4
+            - Kernel: removed 1024 shared-memory loads per nonce (B-side Philox seeds are now compile-time constants)
+            - Kernel: generic fragment fold (supports 8 and 16 fragment presets)
+            - Build: two binaries — `pearlminer_sm89` (main) and `pearlminer_sm89_lite` (higher occupancy)
+            - New `--benchmark [seconds]` mode (no pool needed)
+            - New `--gpu N` / `--gpu-id N` device selection
+            - New `--help`
+            - Occupancy report at startup
+            - HiveOS: `--preset lite` in Extra config switches binary
+          files: pearlminer_sm89-4.4.tar.gz

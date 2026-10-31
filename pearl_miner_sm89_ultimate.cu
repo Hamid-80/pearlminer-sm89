@@ -60,13 +60,20 @@ typedef int sock_t;
 // تنظیمات سخت‌افزاری اختصاصی برای RTX 4070 Ti (60 SMs - Ada Lovelace)
 // ============================================================================
 #define RTX4070TI_SMS       60
+#ifndef BLOCKS_PER_SM
 #define BLOCKS_PER_SM       5       // 5 CTAs per SM = 300 Blocks (20 Active Warps/SM @ 96 Regs)
+#endif
 #define GRID_BLOCKS         (RTX4070TI_SMS * BLOCKS_PER_SM)
 #define BLOCK_THREADS       128     // 4 Warps per Block (1:1 match with Ada 4 Warp Schedulers/SM)
 #define WARP_SIZE           32
+#ifndef N_FRAGMENTS
 #define N_FRAGMENTS         16      // 16x Register Reuse for Matrix A
+#endif
+#ifndef K_STEPS
 #define K_STEPS             64      // Mainloop depth per PearlHash Matrix
+#endif
 #define NONCES_PER_WARP     64      // 64 Nonces/Warp for sustained Tensor Core saturation
+#define PAIRS               (N_FRAGMENTS / 4)
 
 #define OPS_PER_MMA         8192ULL
 #define MMAS_PER_WARP       (K_STEPS * N_FRAGMENTS)
@@ -356,8 +363,6 @@ void pearlhash_sm89_pipelined_kernel(
     const uint32_t job_id,
     ShareResult* __restrict__ d_result) {
     __shared__ alignas(16) uint32_t s_header_key[8];
-    __shared__ alignas(16) uint32_t s_n_hi1[8];
-    __shared__ alignas(16) uint32_t s_n_lo1[8];
 
     const uint32_t tid = threadIdx.x;
     const uint32_t lane_id = tid & 31;
@@ -367,13 +372,6 @@ void pearlhash_sm89_pipelined_kernel(
 
     if (tid < 2) {
         ptx_cp_async_ca_16B(&s_header_key[tid * 4], &d_l2_header_staging[tid * 4]);
-    }
-
-    if (tid < 8) {
-        uint32_t hi, lo;
-        ptx_mul_hi_lo(0xCD9E8D57, tid * 2, hi, lo);
-        s_n_hi1[tid] = hi;
-        s_n_lo1[tid] = lo;
     }
 
     uint32_t lane_hi0, lane_lo0;
@@ -424,17 +422,23 @@ void pearlhash_sm89_pipelined_kernel(
             }
 
             #pragma unroll
-            for (int pair_idx = 0; pair_idx < 4; ++pair_idx) {
+            for (int pair_idx = 0; pair_idx < PAIRS; ++pair_idx) {
                 const int idx0 = pair_idx * 2;
                 const int idx1 = pair_idx * 2 + 1;
                 const int n0   = idx0 * 2;
                 const int n2   = idx1 * 2;
 
+                // [v4.4] B-side Philox seeds are compile-time constants -> folded by ptxas,
+                // no shared-memory loads in the hot loop anymore.
+                uint32_t b_hi0, b_lo0, b_hi1, b_lo1;
+                ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(idx0 * 2), b_hi0, b_lo0);
+                ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(idx1 * 2), b_hi1, b_lo1);
+
                 uint4 raw_b_pair0, raw_b_pair1;
                 philox4x32_10_dual_ilp(
                     lane_hi0, lane_lo0,
-                    s_n_hi1[idx0], s_n_lo1[idx0],
-                    s_n_hi1[idx1], s_n_lo1[idx1],
+                    b_hi0, b_lo0,
+                    b_hi1, b_lo1,
                     k_step, 0xB0B0B0B0, philox_key,
                     raw_b_pair0, raw_b_pair1
                 );
@@ -459,15 +463,13 @@ void pearlhash_sm89_pipelined_kernel(
         uint32_t transcript[4];
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            uint32_t t0 = ptx_xor3((uint32_t)acc[0][i],  (uint32_t)acc[1][i],  (uint32_t)acc[2][i]);
-            uint32_t t1 = ptx_xor3((uint32_t)acc[3][i],  (uint32_t)acc[4][i],  (uint32_t)acc[5][i]);
-            uint32_t t2 = ptx_xor3((uint32_t)acc[6][i],  (uint32_t)acc[7][i],  (uint32_t)acc[8][i]);
-            uint32_t t3 = ptx_xor3((uint32_t)acc[9][i],  (uint32_t)acc[10][i], (uint32_t)acc[11][i]);
-            uint32_t t4 = ptx_xor3((uint32_t)acc[12][i], (uint32_t)acc[13][i], (uint32_t)acc[14][i]);
-
-            uint32_t m0 = ptx_xor3(t0, t1, t2);
-            uint32_t m1 = ptx_xor3(t3, t4, (uint32_t)acc[15][i]);
-            transcript[i] = m0 ^ m1;
+            // [v4.4] Generic fold over N_FRAGMENTS (identical result for 16, also valid for 8)
+            uint32_t fold = 0;
+            #pragma unroll
+            for (int n = 0; n < N_FRAGMENTS; ++n) {
+                fold ^= (uint32_t)acc[n][i];
+            }
+            transcript[i] = fold;
         }
 
         transcript[0] = ptx_warp_xor_reduce(transcript[0]);
@@ -565,7 +567,7 @@ private:
             }
             printf("[Stratum] Authenticating worker: %s\n", full_user.c_str());
 
-            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/4.3\"]}\n";
+            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/4.4\"]}\n";
             std::string auth_msg = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + full_user + "\",\"x\"]}\n";
             send(sock, sub_msg.c_str(), (int)sub_msg.size(), 0);
             send(sock, auth_msg.c_str(), (int)auth_msg.size(), 0);
@@ -742,6 +744,8 @@ int main(int argc, char* argv[]) {
     std::string worker_name     = DEFAULT_WORKER_NAME;
     unsigned int target_core_mhz = DEFAULT_CORE_CLOCK;
     std::string stats_file      = DEFAULT_STATS_FILE;
+    int device_id               = 0;
+    int benchmark_secs          = 0;   // > 0 => benchmark mode (no pool)
 
     // پشتیبانی از پارامترهای خط فرمان مشابه SRBMiner (--pool, --wallet, --worker, --cclock)
     for (int i = 1; i < argc; ++i) {
@@ -754,15 +758,37 @@ int main(int argc, char* argv[]) {
             worker_name = argv[++i];
         } else if ((arg == "--cclock" || arg == "--core-clock") && i + 1 < argc) {
             target_core_mhz = (unsigned int)atoi(argv[++i]);
+        } else if ((arg == "--gpu" || arg == "--gpu-id" || arg == "-g") && i + 1 < argc) {
+            device_id = atoi(argv[++i]);
         } else if (arg == "--stats-file" && i + 1 < argc) {
             stats_file = argv[++i];
+        } else if (arg == "--benchmark") {
+            benchmark_secs = 30;
+            if (i + 1 < argc && argv[i + 1][0] != '-') benchmark_secs = atoi(argv[++i]);
+            if (benchmark_secs <= 0) benchmark_secs = 30;
+        } else if (arg == "--preset" && i + 1 < argc) {
+            ++i; // handled by h-run.sh (binary selection), ignore here
+        } else if (arg == "--help" || arg == "-h") {
+            printf("Usage: pearlminer_sm89 [options]\n"
+                   "  --pool|-o       HOST:PORT            stratum pool (default %s:%d)\n"
+                   "  --wallet|-u     WALLET[.WORKER]      payout address\n"
+                   "  --worker|-w     NAME                 worker name\n"
+                   "  --gpu|-g        INDEX                CUDA device index (default 0)\n"
+                   "  --cclock        MHz                  lock core clock via NVML (0 = off)\n"
+                   "  --stats-file    PATH                 HiveOS stats JSON output\n"
+                   "  --benchmark [S]                      run S seconds without a pool (default 30)\n",
+                   pool_host.c_str(), pool_port);
+            return 0;
         }
     }
 
     printf("====================================================================\n");
-    printf("  PearlHash SM89 Ultimate v4.3 (HiveOS & Windows - RTX 4070 Ti)\n");
+    printf("  PearlHash SM89 Ultimate v4.4 (HiveOS & Windows - RTX 4070 Ti)\n");
     printf("  Pool Address  : %s:%d\n", pool_host.c_str(), pool_port);
     printf("  Wallet Address: %s\n", wallet.c_str());
+    printf("  GPU Index     : %d | Fragments: %d | Blocks/SM: %d\n",
+           device_id, N_FRAGMENTS, BLOCKS_PER_SM);
+    if (benchmark_secs > 0) printf("  Mode          : BENCHMARK (%d s, no pool)\n", benchmark_secs);
     printf("====================================================================\n\n");
 
 #ifdef _WIN32
@@ -775,9 +801,8 @@ int main(int argc, char* argv[]) {
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    g_nvml_ctrl.initialize_and_sleep_vram(0, target_core_mhz);
+    g_nvml_ctrl.initialize_and_sleep_vram((unsigned int)device_id, target_core_mhz);
 
-    int device_id = 0;
     cudaDeviceProp props;
     cudaError_t err = cudaGetDeviceProperties(&props, device_id);
     if (err != cudaSuccess) {
@@ -788,14 +813,23 @@ int main(int argc, char* argv[]) {
     const uint64_t warps_per_grid = GRID_BLOCKS * (BLOCK_THREADS / WARP_SIZE);
     const uint64_t nonces_per_launch = warps_per_grid * NONCES_PER_WARP;
 
-    printf("[GPU 0] Device Name       : %s\n", props.name);
-    printf("[GPU 0] Compute Capability: sm_%d%d (%d SMs | %d MB L2 Cache | VRAM Deep-Sleep)\n",
-           props.major, props.minor, props.multiProcessorCount, props.l2CacheSize / (1024 * 1024));
+    printf("[GPU %d] Device Name       : %s\n", device_id, props.name);
+    printf("[GPU %d] Compute Capability: sm_%d%d (%d SMs | %d MB L2 Cache | VRAM Deep-Sleep)\n",
+           device_id, props.major, props.minor, props.multiProcessorCount, props.l2CacheSize / (1024 * 1024));
 
     if (props.major != 8 || props.minor != 9) {
         printf("[Warning] This binary contains ONLY sm_89 SASS code, but this GPU is sm_%d%d.\n",
                props.major, props.minor);
         printf("[Warning] The kernel will NOT run! Use an RTX 40-series (Ada Lovelace) GPU.\n");
+        fflush(stdout);
+    }
+
+    {
+        int max_blocks_per_sm = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &max_blocks_per_sm, pearlhash_sm89_pipelined_kernel, BLOCK_THREADS, 0);
+        printf("[Info] Kernel occupancy : %d blocks/SM (%d warps/SM)\n",
+               max_blocks_per_sm, max_blocks_per_sm * (BLOCK_THREADS / WARP_SIZE));
         fflush(stdout);
     }
 
@@ -819,7 +853,12 @@ int main(int argc, char* argv[]) {
 
     PearlStratumMiner miner(pool_host, pool_port, wallet, worker_name);
     g_miner_ptr = &miner;
-    miner.connect_to_pool();
+    if (benchmark_secs == 0) {
+        miner.connect_to_pool();
+    } else {
+        printf("[Benchmark] Pool connection skipped (pure GPU benchmark).\n");
+        fflush(stdout);
+    }
 
     PearlJob init_job = miner.get_active_job(0);
     cudaMemcpyToSymbol(c_header_key, init_job.header_key, sizeof(uint32_t) * 8);
@@ -867,11 +906,13 @@ int main(int argc, char* argv[]) {
     }
 
     uint64_t nonce_cursor = 0;
+    uint64_t total_nonces = 0;
     uint32_t last_seen_job_id = init_job.job_id;
 
     auto start_time = std::chrono::high_resolution_clock::now();
     auto last_report_time = start_time;
     uint64_t nonces_since_last_report = 0;
+    auto bench_deadline = start_time + std::chrono::seconds(benchmark_secs > 0 ? benchmark_secs : 0);
 
     PearlJob job0 = miner.get_active_job(nonce_cursor);
     nonce_cursor += nonces_per_launch;
@@ -883,7 +924,8 @@ int main(int argc, char* argv[]) {
 
     int current_stream = 0;
 
-    while (miner.running()) {
+    while (miner.running() &&
+           (benchmark_secs == 0 || std::chrono::high_resolution_clock::now() < bench_deadline)) {
         int next_stream = 1 - current_stream;
 
         PearlJob next_job = miner.get_active_job(nonce_cursor);
@@ -924,6 +966,7 @@ int main(int argc, char* argv[]) {
         }
 
         nonces_since_last_report += nonces_per_launch;
+        total_nonces += nonces_per_launch;
 
         auto now = std::chrono::high_resolution_clock::now();
         double elapsed_sec = std::chrono::duration<double>(now - last_report_time).count();
@@ -940,7 +983,7 @@ int main(int argc, char* argv[]) {
             write_hiveos_telemetry(stats_file, terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
                                    uptime, miner.get_accepted(), miner.get_rejected());
 
-            printf("[Speed v4.3] %.2f TH/s | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u\n",
+            printf("[Speed v4.4] %.2f TH/s | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u\n",
                    terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
                    miner.get_accepted(), miner.get_rejected());
             fflush(stdout);
@@ -957,6 +1000,20 @@ int main(int argc, char* argv[]) {
         cudaGraphDestroy(graphs[s]);
         cudaFreeHost(h_results[s]);
         cudaStreamDestroy(streams[s]);
+    }
+
+    miner.stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    if (benchmark_secs > 0) {
+        auto end_time = std::chrono::high_resolution_clock::now();
+        double total_sec = std::chrono::duration<double>(end_time - start_time).count();
+        double total_ops = (double)total_nonces * (double)HASH_OPS_PER_NONCE;
+        printf("\n[Benchmark] %.1f s | Nonces: %llu | %.2f MH/s | %.2f TH/s (tensor ops)\n",
+               total_sec, (unsigned long long)total_nonces,
+               (double)total_nonces / total_sec / 1e6,
+               (total_ops / total_sec) / 1e12);
+        fflush(stdout);
     }
 
     g_nvml_ctrl.restore_defaults();
