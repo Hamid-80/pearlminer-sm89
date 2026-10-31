@@ -6,8 +6,7 @@
       "coin": "PRL",
       "pool_ssl": false,
       "pool_urls": [
-        "prl-ae.kryptex.network:7048",
-        "prl.kryptex.network:7048"
+        "prl-ae.kryptex.network:7048"
       ],
       "dpool_ssl": false,
       "miner": "custom",
