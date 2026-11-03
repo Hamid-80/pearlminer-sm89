@@ -1,24 +1,24 @@
-﻿{
-  "name": "Kryptex_Pearl_SM89_Custom",
+{
+  "name": "Pearl_Custom_pm_sm89",
   "isFavorite": false,
   "items": [
     {
       "coin": "PRL",
       "pool_ssl": false,
       "pool_urls": [
-        "prl-ae.kryptex.network:7048"
+        "prl.kryptex.network:7048"
       ],
       "dpool_ssl": false,
       "miner": "custom",
       "miner_alt": "pearlminer_sm89",
       "miner_config": {
-        "url": "prl-ae.kryptex.network:7048",
+        "url": "prl.kryptex.network:7048",
         "algo": "pearlhash",
         "pass": "x",
         "miner": "pearlminer_sm89",
         "template": "%WAL%.%WORKER_NAME%",
-        "install_url": "https://github.com/Hamid-80/pearlminer-sm89/releases/download/v4.4/pearlminer_sm89-4.4.tar.gz",
-        "user_config": "--cclock 2730 --stats-file /tmp/pearlminer_stats.json"
+        "install_url": "https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.0/pearlminer_sm89-5.0.tar.gz",
+        "user_config": "--pool %CUSTOM_URL% --wallet %CUSTOM_TEMPLATE% --cclock 2730 --stats-file /tmp/pearlminer_stats.json"
       },
       "pool_geo": []
     }

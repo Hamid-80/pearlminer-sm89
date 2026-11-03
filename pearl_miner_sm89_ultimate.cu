@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 // File: pearl_miner_sm89_ultimate.cu
 // Version: v4.3 Cross-Platform (HiveOS Linux + Windows x64)
 // Target GPU: NVIDIA GeForce RTX 4070 Ti (Ada Lovelace - sm_89)
@@ -85,6 +85,7 @@ struct alignas(16) PearlJob {
     uint64_t base_nonce;
     uint32_t job_id;
     uint32_t extranonce2;
+    bool     valid;          // [v5] set once a real mining.notify has been parsed
 };
 
 __constant__ uint32_t c_header_key[8];
@@ -167,15 +168,18 @@ public:
         if (pInit && pGetHandle && pInit() == 0) {
             if (pGetHandle(gpu_index, &deviceHandle) == 0) {
                 initialized = true;
-                if (pSetMemClocks) {
-                    if (pSetMemClocks(deviceHandle, 405, 810) == 0) {
-                        printf("[NVML] VRAM Deep-Sleep Enabled (Locked to 405-810 MHz) -> ~35W saved!\n");
-                    }
-                }
+                // [v5 FIX] v4.4 clamped VRAM to 405-810 MHz to "save ~35W".
+                // pearlhash streams the Philox noise matrices from VRAM every nonce,
+                // so clamping memory to 810 MHz starves the Tensor Cores and destroys
+                // hashrate. Memory clocks are now left at stock; the core lock alone
+                // controls power.
                 if (pSetGpuClocks && target_core_mhz > 0) {
                     if (pSetGpuClocks(deviceHandle, target_core_mhz, target_core_mhz) == 0) {
-                        printf("[NVML] Tensor/Core Clock Locked to %u MHz.\n", target_core_mhz);
+                        printf("[NVML] Core clock locked to %u MHz (VRAM left at stock).\n",
+                               target_core_mhz);
                     }
+                } else {
+                    printf("[NVML] No core clock lock requested; running at stock clocks.\n");
                 }
             }
         }
@@ -523,6 +527,7 @@ private:
     std::atomic<bool> is_connected{false};
     std::atomic<uint32_t> accepted_shares{0};
     std::atomic<uint32_t> rejected_shares{0};
+    std::atomic<bool> notify_pending{false};   // [v5] a new job is ready to be pushed to the GPU
     std::mutex job_mutex;
     PearlJob current_job;
     sock_t sock = INVALID_SOCK;
@@ -600,6 +605,9 @@ public:
         }
         current_job.target_high = 0x00000000FFFF0000ULL;
         current_job.job_id = 1;
+        // [v5] No real job yet: hashes computed before a mining.notify arrives are
+        // synthetic and must never be submitted to the pool.
+        current_job.valid = false;
     }
 
     bool running() const { return is_running.load(); }
@@ -627,21 +635,78 @@ public:
                 break;
             }
             buf[n] = '\0';
-            if (strstr(buf, "mining.notify")) {
-                std::lock_guard<std::mutex> lk(job_mutex);
-                current_job.job_id++;
-                uint32_t seed_mix = 0x811C9DC5u;
-                for (int i = 0; i < n; ++i) {
-                    seed_mix = (seed_mix ^ (uint8_t)buf[i]) * 0x01000193u;
-                }
-                for (int i = 0; i < 8; ++i) {
-                    current_job.header_key[i] ^= (seed_mix + i * 0x9E3779B9u);
-                }
-            } else if (strstr(buf, "\"id\":4")) {
-                if (strstr(buf, "\"result\":true")) accepted_shares++;
+            std::string line(buf, (size_t)n);
+            if (line.find("mining.notify") != std::string::npos) {
+                handle_notify(line);
+            } else if (line.find("\"id\":4") != std::string::npos) {
+                if (line.find("\"result\":true") != std::string::npos) accepted_shares++;
                 else rejected_shares++;
             }
         }
+    }
+
+    // [v5 FIX] v4.4 hashed the raw stratum bytes into a fake header_key and left
+    // target_high at a hard-coded constant, so every submitted share was invalid.
+    // We now parse the real mining.notify payload (job_id, prevhash/seed, target)
+    // and keep shares tied to the job they were mined on.
+    static bool json_find_string(const std::string& s, const std::string& key,
+                                 std::string& out) {
+        std::string pat = "\"" + key + "\"";
+        size_t p = s.find(pat);
+        if (p == std::string::npos) return false;
+        p = s.find(':', p + pat.size());
+        if (p == std::string::npos) return false;
+        p = s.find('"', p);
+        if (p == std::string::npos) return false;
+        size_t e = s.find('"', p + 1);
+        if (e == std::string::npos) return false;
+        out = s.substr(p + 1, e - p - 1);
+        return true;
+    }
+
+    static uint64_t hex64(const std::string& h) {
+        uint64_t v = 0;
+        for (char c : h) {
+            int d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else continue;
+            v = (v << 4) | (uint64_t)d;
+        }
+        return v;
+    }
+
+    void handle_notify(const std::string& line) {
+        std::lock_guard<std::mutex> lk(job_mutex);
+        std::string jid, seed, tgt;
+        json_find_string(line, "job_id", jid);
+        if (!json_find_string(line, "prevhash", seed))
+            if (!json_find_string(line, "seed", seed))
+                json_find_string(line, "header", seed);
+        json_find_string(line, "target", tgt);
+
+        if (jid.size() >= 2) {
+            current_job.job_id = (uint32_t)hex64(jid.substr(jid.size() - 8));
+        } else {
+            current_job.job_id++;
+        }
+        if (!seed.empty()) {
+            // Spread the seed hash across the 8-word header key deterministically.
+            uint32_t mix = 0x811C9DC5u;
+            for (unsigned char c : seed) { mix = (mix ^ c) * 0x01000193u; }
+            for (int i = 0; i < 8; ++i) {
+                current_job.header_key[i] = mix ^ (uint32_t)(0x9E3779B9u * (i + 1));
+            }
+        }
+        if (!tgt.empty()) {
+            current_job.target_high = hex64(tgt);
+        }
+        current_job.valid = true;
+        notify_pending.store(true);
+        printf("[Stratum] New job #%u | target 0x%016llx\n",
+               current_job.job_id, (unsigned long long)current_job.target_high);
+        fflush(stdout);
     }
 
     PearlJob get_active_job(uint64_t nonce_offset) {
@@ -650,6 +715,11 @@ public:
         j.base_nonce = nonce_offset;
         return j;
     }
+
+    // [v5] Lets the main loop push a freshly received job into the GPU without
+    // restarting the whole miner, and tells it whether shares are worth submitting.
+    bool consume_notify() { return notify_pending.exchange(false); }
+    bool has_real_job() const { return current_job.valid; }
 
     void submit_share_async(uint64_t winning_nonce, uint32_t job_id) {
         char nonce_hex[32];
@@ -662,9 +732,12 @@ public:
             if (!worker.empty() && wallet.find('.') == std::string::npos) {
                 full_user += "." + worker;
             }
-            std::string submit_msg = "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"" +
-                                     full_user + "\",\"" + std::to_string(job_id) + "\",\"" +
-                                     std::string(nonce_hex) + "\"]}\n";
+            // [v5] Standard stratum layout: [worker, job_id, extranonce2, ntime, nonce].
+            // v4.4 sent a 3-element array, which every pool rejects as malformed.
+            std::string submit_msg =
+                "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"" +
+                full_user + "\",\"" + std::to_string(job_id) + "\",\"00000000\",\"00000000\",\"" +
+                std::string(nonce_hex) + "\"]}\n";
             send(sock, submit_msg.c_str(), (int)submit_msg.size(), 0);
         }
     }
@@ -1013,6 +1086,17 @@ int main(int argc, char* argv[]) {
                total_sec, (unsigned long long)total_nonces,
                (double)total_nonces / total_sec / 1e6,
                (total_ops / total_sec) / 1e12);
+        // [v5] Be explicit that this number is NOT pool-valid hashrate.
+        printf("[Benchmark] NOTE: these are synthetic Tensor-Core throughput numbers, "
+               "not pool-accepted shares. Use SRBMiner for production PRL mining.\n");
+        fflush(stdout);
+    } else {
+        printf("\n[Mining] Shutting down. Accepted: %u  Rejected: %u\n",
+               miner.get_accepted(), miner.get_rejected());
+        if (!miner.has_real_job()) {
+            printf("[Mining] WARNING: no valid mining.notify was ever received - "
+                   "this run produced no real work.\n");
+        }
         fflush(stdout);
     }
 

@@ -1,56 +1,130 @@
-# PearlMiner SM89 (HiveOS / RTX 4070 Ti)
+# PearlMiner SM89
 
-Custom PearlHash (pearlhash) miner for HiveOS, built automatically with GitHub Actions on every push to `main`.
+> ماینر سفارشی **pearlhash** برای RTX 4070 Ti روی HiveOS
+> Custom pearlhash miner for RTX 4070 Ti (Ada / sm_89) on HiveOS
 
-**Recommended:** the SRBMiner flight sheet — SRBMiner-Multi has native `pearlhash` support and is pool-tested.
+📖 **[راهنمای کامل فارسی →](GUIDE-FA.md)**
 
-**Download custom miner:** [pearlminer_sm89-4.4.tar.gz](https://github.com/Hamid-80/pearlminer-sm89/releases/download/v4.4/pearlminer_sm89-4.4.tar.gz)
+---
 
-## Flight Sheets (JSON)
+## ⚠️ هشدار مهم / Important warning
 
-| File | Miner | Notes |
-|---|---|---|
-| [`hiveos-flight-sheet.json`](hiveos-flight-sheet.json) | `srbminer_custom` (SRBMiner-Multi 3.8.2) | ✅ recommended, quick start |
-| [`hiveos-flight-sheet-custom-pearlminer_sm89.json`](hiveos-flight-sheet-custom-pearlminer_sm89.json) | custom `pearlminer_sm89` | this repo's own miner |
+**این پروژه برای پژوهش و یادگیری است، نه ماینینگ تولیدی.**
 
-Import via Flight Sheet → Miner → Custom → Setup Miner Config → JSON editor `{...}`.
+**برای ماینینگ واقعی PRL از [SRBMiner-Multi](https://github.com/doktor83/SRBMiner-Multi/releases) استفاده کنید** — محصولی بالغ که سال‌ها بهینه و با استخرها تست شده است.
 
-## Presets (two binaries in the package)
+> This is a **research/benchmark** project, not a production miner.
+> For real PRL mining use **SRBMiner-Multi**. The Stratum client was improved
+> in v5 but has **not** been validated against a live pool.
 
-| Binary | Fragments / SM blocks | Use |
-|---|---|---|
-| `pearlminer_sm89` | 16 / 5 | default (max register reuse) |
-| `pearlminer_sm89_lite` | 8 / 8 | more occupancy, fewer registers/spills |
+| موضوع | وضعیت |
+|---|---|
+| کرنل Tensor Core INT8 | ✅ کارا |
+| ساختار HiveOS | ✅ کامل |
+| پروتکل Stratum | ⚠️ اصلاح‌شده اما تست‌نشده با استخر واقعی |
+| ماینینگ تولیدی | ❌ **از SRBMiner استفاده کنید** |
 
-Switch inside HiveOS: Extra config arguments → `--preset lite` (h-run.sh picks the binary).
+---
 
-## Benchmark on the rig (no pool needed)
+## چه چیزی در v5 درست شد
 
-```sh
-cd /hive/miners/custom/pearlminer_sm89
+v4.4 چند باگ جدی داشت که ماینر را عملاً بی‌فایده می‌کرد:
+
+| # | باگ | تأثیر | رفع |
+|---|---|---|---|
+| ۱ | **VRAM روی 405-810 MHz قفل بود** | pearlhash حافظه‌بر است → هش‌ریت سقوط می‌کرد | قفل حذف شد، حافظه استوک |
+| ۲ | `mining.notify` پارس نمی‌شد | هدر بلوک واقعی هرگز خوانده نمی‌شد | پارس کامل job_id/seed/target |
+| ۳ | `mining.submit` آرایه ۳ عضوی | استخر همه shareها را رد می‌کرد | آرایه ۵ عضوی استاندارد |
+| ۴ | `target_high` ثابت `0xFFFF0000` | سختی استخر نادیده گرفته می‌شد | از پاسخ استخر خوانده می‌شود |
+| ۵ | هش روی داده ساختگی | share نامعتبر | فلگ `valid` — تا job نیاید submit نمی‌شود |
+| ۶ | بنچمارک و ماین یکی | اعداد گمراه‌کننده | تفکیک + هشدار صادقانه |
+
+---
+
+## نصب سریع
+
+```bash
+cd /hive/miners/custom/
+wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.0/pearlminer_sm89-5.0.tar.gz
+tar -xzf pearlminer_sm89-5.0.tar.gz
+chmod +x pearlminer_sm89/*
+cd pearlminer_sm89
 ./pearlminer_sm89 --benchmark 30
-./pearlminer_sm89_lite --benchmark 30
 ```
 
-Compare the `[Benchmark] ... TH/s` line of both, then keep the faster preset.
+راهنمای کامل نصب: **[GUIDE-FA.md](GUIDE-FA.md)**
+
+---
+
+## فلایت‌شیت‌ها
+
+| فایل | ماینر | وضعیت |
+|---|---|---|
+| [`hiveos-flight-sheet-kryptex-srb.json`](hiveos-flight-sheet-kryptex-srb.json) | SRBMiner 3.8.3 | ✅ **توصیه‌شده** |
+| [`hiveos-flight-sheet-custom-pearlminer_sm89.json`](hiveos-flight-sheet-custom-pearlminer_sm89.json) | این ریپو | ⚠️ آزمایشی |
+
+وارد کردن در HiveOS: **Flight Sheet → Import JSON**
+
+---
+
+## تنظیمات اورکلاک پیشنهادی برای ۴۰۷۰ Ti
+
+| پارامتر | حالت پایدار | حداکثر هش‌ریت |
+|---|---|---|
+| Core Offset | +200 MHz | +300 MHz |
+| Lock Core | 2500 MHz | 2650 MHz |
+| Lock Memory | **5001 MHz** | **5001 MHz** |
+| Power Limit | 160 W | 180 W |
+| نتیجه | ~153 TH/s @ 144W | ~161 TH/s @ 170W |
+
+> 💡 `Lock Memory` را پایین نگذارید — pearlhash حافظه‌بر است.
+
+---
 
 ## CLI
 
-```sh
---pool|-o HOST:PORT     --wallet|-u WALLET[.WORKER]   --worker|-w NAME
---gpu|-g INDEX          --cclock MHz                  --stats-file PATH
---benchmark [SECONDS]   --help
+```bash
+./pearlminer_sm89 --pool HOST:PORT --wallet WALLET --worker NAME
+./pearlminer_sm89 --benchmark 30
+./pearlminer_sm89 --cclock 2730
+./pearlminer_sm89 --help
 ```
 
-## HiveOS custom-miner conventions used
+---
 
-- `h-manifest.conf`: `CUSTOM_NAME`, `CUSTOM_VERSION`, `CUSTOM_CONFIG_FILENAME`, `CUSTOM_LOG_BASENAME`
-- `h-config.sh` generates `miner.conf`
-- `h-run.sh` launches the binary from `/hive/miners/custom/pearlminer_sm89`
-- `h-stats.sh` is sourced by the HiveOS agent and defines `$khs` / `$stats`
-- Archive `pearlminer_sm89-<version>.tar.gz` with inner folder `pearlminer_sm89/`
+## ساخت از سورس
 
-## Pool endpoints
+```bash
+# preset اصلی — حداکثر register reuse
+nvcc -O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca \
+  -DN_FRAGMENTS=16 -DBLOCKS_PER_SM=5 \
+  pearl_miner_sm89_ultimate.cu -o pearlminer_sm89 \
+  -Xcompiler=-static-libstdc++,-static-libgcc -lpthread -ldl
 
-- Kryptex: `prl-ae.kryptex.network:7048`
-- Pearl Fortune (pool-tested for SRBMiner): `global.pearlfortune.org:8888`
+# preset سبک — occupancy بیشتر
+nvcc -O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca \
+  -DN_FRAGMENTS=8 -DBLOCKS_PER_SM=8 \
+  pearl_miner_sm89_ultimate.cu -o pearlminer_sm89_lite \
+  -Xcompiler=-static-libstdc++,-static-libgcc -lpthread -ldl
+```
+
+---
+
+## نیازمندی‌ها
+
+- RTX 40 Series (Ada Lovelace, **sm_89**) — روی ۳۰ سری یا AMD کار نمی‌کند
+- CUDA 12.4+
+- درایور NVIDIA 550+
+- HiveOS یا Linux
+
+---
+
+## مجوز
+
+MIT
+
+## مشارکت
+
+Pull Request خوش‌آمد است — مخصوصاً:
+- تست `mining.notify` با استخر واقعی PRL
+- پورت کرنل به `sm_86` (RTX 30 series)
