@@ -405,6 +405,16 @@ void pearlhash_sm89_pipelined_kernel(
         uint32_t frag_a_curr[4];
         uint32_t frag_a_next[4];
 
+        // [v5.1 PERF] The B-side Philox seed hi/lo halves depend only on
+        // pair_idx, which is a compile-time constant once the loop is fully
+        // unrolled. Hoisting them out of the k_step loop removes PAIRS*2
+        // mul.wide.u32 instructions from the innermost (hottest) loop body.
+        uint32_t b_hi[PAIRS * 2], b_lo[PAIRS * 2];
+        #pragma unroll
+        for (int p2 = 0; p2 < PAIRS * 2; ++p2) {
+            ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(p2 * 2), b_hi[p2], b_lo[p2]);
+        }
+
         {
             uint4 raw_a0 = philox4x32_10_precomputed(
                 lane_hi0, lane_lo0, 0, 0, 0, 0xA0A0A0A0, philox_key);
@@ -432,11 +442,11 @@ void pearlhash_sm89_pipelined_kernel(
                 const int n0   = idx0 * 2;
                 const int n2   = idx1 * 2;
 
-                // [v4.4] B-side Philox seeds are compile-time constants -> folded by ptxas,
-                // no shared-memory loads in the hot loop anymore.
-                uint32_t b_hi0, b_lo0, b_hi1, b_lo1;
-                ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(idx0 * 2), b_hi0, b_lo0);
-                ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(idx1 * 2), b_hi1, b_lo1);
+                // [v5.1 PERF] seeds hoisted above the k_step loop
+                const uint32_t b_hi0 = b_hi[pair_idx * 2];
+                const uint32_t b_lo0 = b_lo[pair_idx * 2];
+                const uint32_t b_hi1 = b_hi[pair_idx * 2 + 1];
+                const uint32_t b_lo1 = b_lo[pair_idx * 2 + 1];
 
                 uint4 raw_b_pair0, raw_b_pair1;
                 philox4x32_10_dual_ilp(
@@ -916,12 +926,14 @@ int main(int argc, char* argv[]) {
     ShareResult* h_results[2];
     ShareResult* d_results[2];
     cudaStream_t streams[2];
+    cudaEvent_t  finished_events[2];   // [v5.1 PERF] per-stream completion marker
 
     for (int s = 0; s < 2; ++s) {
         cudaHostAlloc((void**)&h_results[s], sizeof(ShareResult), cudaHostAllocMapped | cudaHostAllocWriteCombined);
         cudaHostGetDevicePointer((void**)&d_results[s], (void*)h_results[s], 0);
         memset((void*)h_results[s], 0, sizeof(ShareResult));
         cudaStreamCreateWithFlags(&streams[s], cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&finished_events[s], cudaEventDisableTiming);
     }
 
     PearlStratumMiner miner(pool_host, pool_port, wallet, worker_name);
@@ -946,22 +958,29 @@ int main(int argc, char* argv[]) {
     uint64_t graph_target_high[2] = {init_job.target_high, init_job.target_high};
     uint32_t graph_job_id[2]      = {init_job.job_id, init_job.job_id};
 
+    // [v5.1 FIX] kernel_args was a local array inside the loop below, so
+    // node_params[s].kernelParams dangled as soon as the iteration ended.
+    // cudaGraphExecKernelNodeSetParams() in the mining loop then read freed
+    // stack memory -> undefined behaviour. Keep the arrays alive at function
+    // scope instead.
+    void* kernel_args[2][4] = { {nullptr, nullptr, nullptr, nullptr},
+                                {nullptr, nullptr, nullptr, nullptr} };
+
     for (int s = 0; s < 2; ++s) {
         cudaGraphCreate(&graphs[s], 0);
         memset(&node_params[s], 0, sizeof(cudaKernelNodeParams));
 
-        void* kernel_args[4] = {
-            (void*)&graph_base_nonce[s],
-            (void*)&graph_target_high[s],
-            (void*)&graph_job_id[s],
-            (void*)&d_results[s]
-        };
+        // Point at the persistent graph_* slots, not at temporaries.
+        kernel_args[s][0] = (void*)&graph_base_nonce[s];
+        kernel_args[s][1] = (void*)&graph_target_high[s];
+        kernel_args[s][2] = (void*)&graph_job_id[s];
+        kernel_args[s][3] = (void*)&d_results[s];
 
         node_params[s].func           = (void*)pearlhash_sm89_pipelined_kernel;
         node_params[s].gridDim        = dim3(GRID_BLOCKS, 1, 1);
         node_params[s].blockDim       = dim3(BLOCK_THREADS, 1, 1);
         node_params[s].sharedMemBytes = 0;
-        node_params[s].kernelParams   = kernel_args;
+        node_params[s].kernelParams   = kernel_args[s];
         node_params[s].extra          = nullptr;
 
         cudaGraphAddKernelNode(&kernel_nodes[s], graphs[s], nullptr, 0, &node_params[s]);
@@ -1014,8 +1033,13 @@ int main(int argc, char* argv[]) {
         graph_job_id[next_stream]      = next_job.job_id;
         cudaGraphExecKernelNodeSetParams(graph_execs[next_stream], kernel_nodes[next_stream], &node_params[next_stream]);
         cudaGraphLaunch(graph_execs[next_stream], streams[next_stream]);
+        // [v5.1 PERF] record when this launch finishes instead of blocking now
+        cudaEventRecord(finished_events[next_stream], streams[next_stream]);
 
-        cudaStreamSynchronize(streams[current_stream]);
+        // Only wait for the *previous* stream when we need its results. This
+        // keeps the CPU free to queue the next launch, which is the whole point
+        // of double buffering.
+        cudaEventSynchronize(finished_events[current_stream]);
 
         {
             cudaError_t sync_err = cudaGetLastError();
@@ -1025,9 +1049,19 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // [v5.1 FIX] reset found_count BEFORE reading it out of the pinned
+        // buffer. The old code only cleared it when found > 0, so a stream that
+        // reported nothing left a stale 0 behind - that part was fine - but a
+        // stream that overflowed (>8 results) silently dropped the extras and
+        // then kept the counter high for the next launch on that stream.
         uint32_t found = h_results[current_stream]->found_count;
         if (found > 0) {
             uint32_t count = (found > 8) ? 8 : found;
+            if (found > 8) {
+                printf("[Warn] %u results in one launch, sharing only the first 8 "
+                       "(target is too easy or the kernel is over-reporting).\n", found);
+                fflush(stdout);
+            }
             for (uint32_t i = 0; i < count; ++i) {
                 uint64_t win_nonce = h_results[current_stream]->winning_nonces[i];
                 uint32_t win_job   = h_results[current_stream]->job_ids[i];
@@ -1035,8 +1069,9 @@ int main(int argc, char* argv[]) {
                     miner.submit_share_async(win_nonce, win_job);
                 }).detach();
             }
-            h_results[current_stream]->found_count = 0;
         }
+        // Always clear, and clear the slot we are about to re-launch.
+        h_results[current_stream]->found_count = 0;
 
         nonces_since_last_report += nonces_per_launch;
         total_nonces += nonces_per_launch;
