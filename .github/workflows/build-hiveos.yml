@@ -3,6 +3,7 @@ name: Build HiveOS Custom Miner Package
 on:
   push:
     branches: [ "main", "master" ]
+    tags: [ "v*" ]          # [v5.1] build an installable package for every release tag
   workflow_dispatch:
 
 permissions:
@@ -91,21 +92,37 @@ jobs:
           EOF
 
           chmod +x pearlminer_sm89/h-config.sh pearlminer_sm89/h-run.sh
-          tar -czvf pearlminer_sm89-4.4.tar.gz pearlminer_sm89/
+          # [v5.1 FIX] derive the version from the tag instead of hard-coding it.
+          # Before this, every build published a file called pearlminer_sm89-4.4.tar.gz
+          # onto the v4.4 release, so v5.0 / v5.1 releases had NO installable asset
+          # and the HiveOS flight-sheet install_url 404'd.
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ -z "$VERSION" || "$VERSION" == "$GITHUB_REF_NAME" ]]; then
+            VERSION="0.0.0-${GITHUB_SHA::7}"
+          fi
+          echo "PACKAGE_VERSION=$VERSION" >> "$GITHUB_ENV"
+          sed -i "s/^CUSTOM_VERSION=.*/CUSTOM_VERSION=${VERSION}/" pearlminer_sm89/h-manifest.conf
+          echo "Building pearlminer_sm89-${VERSION}.tar.gz"
+          tar -czvf "pearlminer_sm89-${VERSION}.tar.gz" pearlminer_sm89/
+          ls -la *.tar.gz
 
       - name: Publish Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v4.4
-          name: "PearlMiner SM89 v4.4 (HiveOS & RTX 4070 Ti)"
+          # attach to whatever tag triggered the build; for a branch push fall back to a rolling tag
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest-build' }}
+          name: PearlMiner SM89 ${{ env.PACKAGE_VERSION }}
           body: |
-            ## v4.4
-            - Kernel: removed 1024 shared-memory loads per nonce (B-side Philox seeds are now compile-time constants)
-            - Kernel: generic fragment fold (supports 8 and 16 fragment presets)
-            - Build: two binaries — `pearlminer_sm89` (main) and `pearlminer_sm89_lite` (higher occupancy)
-            - New `--benchmark [seconds]` mode (no pool needed)
-            - New `--gpu N` / `--gpu-id N` device selection
-            - New `--help`
-            - Occupancy report at startup
-            - HiveOS: `--preset lite` in Extra config switches binary
-          files: pearlminer_sm89-4.4.tar.gz
+            ## PearlMiner SM89 ${{ env.PACKAGE_VERSION }}
+
+            Installable HiveOS package: `pearlminer_sm89-${{ env.PACKAGE_VERSION }}.tar.gz`
+
+            ### Install
+            ```bash
+            cd /hive/miners/custom/
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_type == 'tag' && github.ref_name || 'latest-build' }}/pearlminer_sm89-${{ env.PACKAGE_VERSION }}.tar.gz
+            tar -xzf pearlminer_sm89-${{ env.PACKAGE_VERSION }}.tar.gz
+            chmod +x pearlminer_sm89/*
+            ```
+          files: pearlminer_sm89-${{ env.PACKAGE_VERSION }}.tar.gz
+

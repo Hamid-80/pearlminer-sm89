@@ -6,19 +6,19 @@
       "coin": "PRL",
       "pool_ssl": false,
       "pool_urls": [
-        "prl.kryptex.network:7048"
+        "prl-ae.kryptex.network:7048"
       ],
       "dpool_ssl": false,
       "miner": "custom",
       "miner_alt": "srbminer_custom",
       "miner_config": {
-        "url": "prl.kryptex.network:7048",
+        "url": "prl-ae.kryptex.network:7048",
         "algo": "pearlhash",
         "pass": "x",
         "miner": "srbminer_custom",
         "template": "%WAL%.%WORKER_NAME%",
         "install_url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.3/srbminer_custom-3.8.3.tar.gz",
-        "user_config": "--algorithm-gpu pearlhash --wallet %WAL%.%WORKER_NAME% --pool prl.kryptex.network:7048"
+        "user_config": "--algorithm-gpu pearlhash --wallet %WAL%.%WORKER_NAME% --pool prl-ae.kryptex.network:7048"
       },
       "pool_geo": []
     }
