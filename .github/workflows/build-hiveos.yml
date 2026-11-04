@@ -29,17 +29,14 @@ jobs:
           COMMON="-O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca"
           LINK="-Xcompiler=-static-libstdc++,-static-libgcc -lpthread -ldl"
 
-          # [v5.4] Register pressure investigation.
-          #
-          # v5.3 capped registers at 96 but ptxas still emitted a 336-byte stack
-          # frame with 540 bytes of spill traffic, which is why the card idled at
-          # ~45 W / 33 C. acc[N_FRAGMENTS][4] costs 4*N_FRAGMENTS registers, so:
-          #   N_FRAGMENTS=16 -> 64 acc regs + live Philox state  (too tight)
-          #   N_FRAGMENTS=8  -> 32 acc regs                        (comfortable)
-          # We now build both and print the spill figures so the choice is made
-          # from evidence instead of guesswork.
-          echo "=== main preset: 8 fragments, 72 regs, 6 blocks/SM ==="
-          nvcc $COMMON -Xptxas=-v -maxrregcount=72 -DN_FRAGMENTS=8 -DBLOCKS_PER_SM=6 \
+          # [v5.6] After hoisting B into shared memory (v5.5), B no longer consumes
+          # registers, so the accumulator can go back to N_FRAGMENTS=16 without
+          # the spill that plagued v5.3/v5.4. More fragments = more tensor-core
+          # MACs per nonce = more useful work per watt once the board power budget
+          # is raised to ~170 W. acc[16][4] costs 64 regs; adding A's live state
+          # (~14) stays under 96 with no spill.
+          echo "=== main preset: 16 fragments, 96 regs, 5 blocks/SM ==="
+          nvcc $COMMON -Xptxas=-v -maxrregcount=96 -DN_FRAGMENTS=16 -DBLOCKS_PER_SM=5 \
             pearl_miner_sm89_ultimate.cu -o pearlminer_sm89/pearlminer_sm89 $LINK 2>&1 | tee main_build.log
 
           echo "=== lite preset: 8 fragments, 64 regs, 8 blocks/SM ==="
