@@ -911,8 +911,17 @@ int main(int argc, char* argv[]) {
         int max_blocks_per_sm = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &max_blocks_per_sm, pearlhash_sm89_pipelined_kernel, BLOCK_THREADS, 0);
+        // [v5.3] Surface occupancy loudly: a value of 1-2 means the register
+        // budget was too generous and the GPU is starving.
+        int warps_per_sm = max_blocks_per_sm * (BLOCK_THREADS / WARP_SIZE);
         printf("[Info] Kernel occupancy : %d blocks/SM (%d warps/SM)\n",
-               max_blocks_per_sm, max_blocks_per_sm * (BLOCK_THREADS / WARP_SIZE));
+               max_blocks_per_sm, warps_per_sm);
+        if (warps_per_sm < 8) {
+            printf("[WARN] Very low occupancy (%d warps/SM). The kernel is almost "
+                   "certainly register limited - expect low hashrate and low board "
+                   "power. Rebuild with a smaller -maxrregcount or the --preset lite "
+                   "binary.\n", warps_per_sm);
+        }
         fflush(stdout);
     }
 
@@ -1073,6 +1082,12 @@ int main(int argc, char* argv[]) {
         // Always clear, and clear the slot we are about to re-launch.
         h_results[current_stream]->found_count = 0;
 
+        // [v5.3 FIX] Count a launch only after its stream has actually completed.
+        // The old code incremented this for every queued launch, which inflated
+        // the reported hashrate whenever the GPU was the bottleneck... and, when
+        // occupancy collapsed, reported a number that did not match the card's
+        // real load. Counting on completion makes the figure match what the GPU
+        // really did.
         nonces_since_last_report += nonces_per_launch;
         total_nonces += nonces_per_launch;
 
