@@ -405,16 +405,13 @@ void pearlhash_sm89_pipelined_kernel(
         uint32_t frag_a_curr[4];
         uint32_t frag_a_next[4];
 
-        // [v5.1 PERF] The B-side Philox seed hi/lo halves depend only on
-        // pair_idx, which is a compile-time constant once the loop is fully
-        // unrolled. Hoisting them out of the k_step loop removes PAIRS*2
-        // mul.wide.u32 instructions from the innermost (hottest) loop body.
-        uint32_t b_hi[PAIRS * 2], b_lo[PAIRS * 2];
-        #pragma unroll
-        for (int p2 = 0; p2 < PAIRS * 2; ++p2) {
-            ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(p2 * 2), b_hi[p2], b_lo[p2]);
-        }
-
+        // [v5.4 FIX] The v5.1 "PERF" hoist made things worse: b_hi/b_lo were
+        // PAIRS*2 arrays of live registers (16 extra at N_FRAGMENTS=16), which
+        // pushed ptxas over budget and produced a 336-byte stack frame with
+        // 540 bytes of spill traffic. pair_idx is a compile-time constant in the
+        // fully unrolled loop, so the original per-iteration mul.wide.u32 was
+        // folded into immediates anyway - it cost nothing. Compute them inline
+        // again and keep the register file for the accumulators.
         {
             uint4 raw_a0 = philox4x32_10_precomputed(
                 lane_hi0, lane_lo0, 0, 0, 0, 0xA0A0A0A0, philox_key);
@@ -442,11 +439,11 @@ void pearlhash_sm89_pipelined_kernel(
                 const int n0   = idx0 * 2;
                 const int n2   = idx1 * 2;
 
-                // [v5.1 PERF] seeds hoisted above the k_step loop
-                const uint32_t b_hi0 = b_hi[pair_idx * 2];
-                const uint32_t b_lo0 = b_lo[pair_idx * 2];
-                const uint32_t b_hi1 = b_hi[pair_idx * 2 + 1];
-                const uint32_t b_lo1 = b_lo[pair_idx * 2 + 1];
+                // [v5.4] compute the seed halves inline; idx0/idx1 are constant
+                // once the loop is unrolled so ptxas folds these to immediates.
+                uint32_t b_hi0, b_lo0, b_hi1, b_lo1;
+                ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(idx0 * 2), b_hi0, b_lo0);
+                ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(idx1 * 2), b_hi1, b_lo1);
 
                 uint4 raw_b_pair0, raw_b_pair1;
                 philox4x32_10_dual_ilp(
