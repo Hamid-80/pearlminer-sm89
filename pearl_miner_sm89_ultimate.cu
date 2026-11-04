@@ -367,6 +367,12 @@ void pearlhash_sm89_pipelined_kernel(
     const uint32_t job_id,
     ShareResult* __restrict__ d_result) {
     __shared__ alignas(16) uint32_t s_header_key[8];
+    // [v5.5] Precomputed B (weight) fragments. In real Pearl the B matrix is
+    // noised ONCE per job and then the GEMM iterates nonces over it; this kernel
+    // was regenerating B for every single nonce (K_STEPS*PAIRS*2 Philox calls
+    // per nonce), which burned power in the scalar units while the tensor cores
+    // waited. Store B once per block and reuse it across all NONCES_PER_WARP.
+    __shared__ alignas(16) uint32_t s_B[K_STEPS * PAIRS * 8];
 
     const uint32_t tid = threadIdx.x;
     const uint32_t lane_id = tid & 31;
@@ -386,6 +392,43 @@ void pearlhash_sm89_pipelined_kernel(
 
     const uint32_t hk0 = s_header_key[0];
     const uint32_t hk1 = s_header_key[1];
+
+    // [v5.5] Cooperative one-time generation of the B matrix fragments into
+    // shared memory, keyed off the header (NOT the nonce), so they are identical
+    // for every nonce and can be reused. Each thread fills a disjoint slice.
+    {
+        const uint2 b_key = make_uint2(hk0, hk1);
+        const uint32_t total = K_STEPS * PAIRS;
+        for (uint32_t c = tid; c < total; c += BLOCK_THREADS) {
+            const uint32_t k_step = c / PAIRS;
+            const uint32_t pair_idx = c % PAIRS;
+            const uint32_t idx0 = pair_idx * 2;
+            const uint32_t idx1 = pair_idx * 2 + 1;
+
+            uint32_t b_hi0, b_lo0, b_hi1, b_lo1;
+            ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(idx0 * 2), b_hi0, b_lo0);
+            ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(idx1 * 2), b_hi1, b_lo1);
+
+            uint4 raw_b_pair0, raw_b_pair1;
+            philox4x32_10_dual_ilp(
+                0, 0,                 // lane-independent seed for a coherent B
+                b_hi0, b_lo0,
+                b_hi1, b_lo1,
+                k_step, 0xB0B0B0B0, b_key,
+                raw_b_pair0, raw_b_pair1);
+
+            uint32_t* dst = &s_B[c * 8];
+            dst[0] = ptx_mask_int7(raw_b_pair0.x);
+            dst[1] = ptx_mask_int7(raw_b_pair0.y);
+            dst[2] = ptx_mask_int7(raw_b_pair0.z);
+            dst[3] = ptx_mask_int7(raw_b_pair0.w);
+            dst[4] = ptx_mask_int7(raw_b_pair1.x);
+            dst[5] = ptx_mask_int7(raw_b_pair1.y);
+            dst[6] = ptx_mask_int7(raw_b_pair1.z);
+            dst[7] = ptx_mask_int7(raw_b_pair1.w);
+        }
+    }
+    __syncthreads();
 
     #pragma unroll 1
     for (uint32_t n_iter = 0; n_iter < NONCES_PER_WARP; ++n_iter) {
@@ -439,25 +482,14 @@ void pearlhash_sm89_pipelined_kernel(
                 const int n0   = idx0 * 2;
                 const int n2   = idx1 * 2;
 
-                // [v5.4] compute the seed halves inline; idx0/idx1 are constant
-                // once the loop is unrolled so ptxas folds these to immediates.
-                uint32_t b_hi0, b_lo0, b_hi1, b_lo1;
-                ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(idx0 * 2), b_hi0, b_lo0);
-                ptx_mul_hi_lo(0xCD9E8D57, (uint32_t)(idx1 * 2), b_hi1, b_lo1);
-
-                uint4 raw_b_pair0, raw_b_pair1;
-                philox4x32_10_dual_ilp(
-                    lane_hi0, lane_lo0,
-                    b_hi0, b_lo0,
-                    b_hi1, b_lo1,
-                    k_step, 0xB0B0B0B0, philox_key,
-                    raw_b_pair0, raw_b_pair1
-                );
-
-                uint32_t frag_b0[2] = { ptx_mask_int7(raw_b_pair0.x), ptx_mask_int7(raw_b_pair0.y) };
-                uint32_t frag_b1[2] = { ptx_mask_int7(raw_b_pair0.z), ptx_mask_int7(raw_b_pair0.w) };
-                uint32_t frag_b2[2] = { ptx_mask_int7(raw_b_pair1.x), ptx_mask_int7(raw_b_pair1.y) };
-                uint32_t frag_b3[2] = { ptx_mask_int7(raw_b_pair1.z), ptx_mask_int7(raw_b_pair1.w) };
+                // [v5.5] Load B from the precomputed shared-memory table instead
+                // of regenerating it with Philox for every nonce. This removes
+                // K_STEPS*PAIRS*2 Philox calls from the hot loop entirely.
+                const uint32_t* bsrc = &s_B[(k_step * PAIRS + pair_idx) * 8];
+                uint32_t frag_b0[2] = { bsrc[0], bsrc[1] };
+                uint32_t frag_b1[2] = { bsrc[2], bsrc[3] };
+                uint32_t frag_b2[2] = { bsrc[4], bsrc[5] };
+                uint32_t frag_b3[2] = { bsrc[6], bsrc[7] };
 
                 ptx_mma_m16n8k32_s8(acc[n0],     frag_a_curr, frag_b0, acc[n0]);
                 ptx_mma_m16n8k32_s8(acc[n0 + 1], frag_a_curr, frag_b1, acc[n0 + 1]);
