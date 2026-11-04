@@ -83,9 +83,10 @@ struct alignas(16) PearlJob {
     uint32_t header_key[8];
     uint64_t target_high;
     uint64_t base_nonce;
-    uint32_t job_id;
+    uint32_t job_id;              // hashed id for the GPU kernel
     uint32_t extranonce2;
-    bool     valid;          // [v5] set once a real mining.notify has been parsed
+    bool     valid;               // [v5] set once a real mining.notify has been parsed
+    char     job_id_str[64];      // [v5.7] raw job_id string the pool expects on submit
 };
 
 __constant__ uint32_t c_header_key[8];
@@ -644,6 +645,7 @@ public:
         }
         current_job.target_high = 0x00000000FFFF0000ULL;
         current_job.job_id = 1;
+        snprintf(current_job.job_id_str, sizeof(current_job.job_id_str), "1");
         // [v5] No real job yet: hashes computed before a mining.notify arrives are
         // synthetic and must never be submitted to the pool.
         current_job.valid = false;
@@ -726,9 +728,17 @@ public:
         json_find_string(line, "target", tgt);
 
         if (jid.size() >= 2) {
-            current_job.job_id = (uint32_t)hex64(jid.substr(jid.size() - 8));
+            // [v5.7 FIX] Kryptex sends job_id like "58d5fbb2_4194304". The old
+            // code hex-parsed the last 8 chars "4194304" (mostly non-hex) which
+            // produced a garbage id. Hash the FULL string to a stable uint32 for
+            // the kernel, AND keep the original string for the submit message.
+            uint32_t h = 0x811C9DC5u;
+            for (unsigned char c : jid) { h = (h ^ c) * 0x01000193u; }
+            current_job.job_id = h;
+            snprintf(current_job.job_id_str, sizeof(current_job.job_id_str), "%s", jid.c_str());
         } else {
             current_job.job_id++;
+            snprintf(current_job.job_id_str, sizeof(current_job.job_id_str), "%u", current_job.job_id);
         }
         if (!seed.empty()) {
             // Spread the seed hash across the 8-word header key deterministically.
@@ -739,7 +749,11 @@ public:
             }
         }
         if (!tgt.empty()) {
-            current_job.target_high = hex64(tgt);
+            // [v5.7 FIX] Kryptex target is 256-bit ("00000000000003ff...") and
+            // does not fit a uint64. Take the first 16 hex chars as the dominant
+            // high-order bits. For a target full of leading zeroes this yields
+            // 0x00000000000003ff which keeps the difficulty ordering correct.
+            current_job.target_high = hex64(tgt.substr(0, 16));
         }
         current_job.valid = true;
         notify_pending.store(true);
@@ -763,19 +777,20 @@ public:
     void submit_share_async(uint64_t winning_nonce, uint32_t job_id) {
         char nonce_hex[32];
         snprintf(nonce_hex, sizeof(nonce_hex), "%016llx", (unsigned long long)winning_nonce);
-        printf("\n[SHARE FOUND!] Job #%u | Nonce: 0x%s | Submitting to %s...\n",
-               job_id, nonce_hex, host.c_str());
+        // [v5.7] Read the raw job_id string for the CURRENT job; the pool echoes
+        // it back verbatim, so submit with the original ("58d5fbb2_4194304").
+        std::string jid_str(current_job.job_id_str);
+        printf("\n[SHARE FOUND!] Job #%s | Nonce: 0x%s | Submitting to %s...\n",
+               jid_str.c_str(), nonce_hex, host.c_str());
 
         if (is_connected.load() && sock != INVALID_SOCK) {
             std::string full_user = wallet;
             if (!worker.empty() && wallet.find('.') == std::string::npos) {
                 full_user += "." + worker;
             }
-            // [v5] Standard stratum layout: [worker, job_id, extranonce2, ntime, nonce].
-            // v4.4 sent a 3-element array, which every pool rejects as malformed.
             std::string submit_msg =
                 "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"" +
-                full_user + "\",\"" + std::to_string(job_id) + "\",\"00000000\",\"00000000\",\"" +
+                full_user + "\",\"" + jid_str + "\",\"00000000\",\"00000000\",\"" +
                 std::string(nonce_hex) + "\"]}\n";
             send(sock, submit_msg.c_str(), (int)submit_msg.size(), 0);
         }
