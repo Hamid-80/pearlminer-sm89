@@ -1,0 +1,36 @@
+# NOTICE — third-party attributions
+
+This project (pearlminer-sm89) is an sm89 / Ada Lovelace HiveOS packaging of
+the REAL, open-source Pearl (PRL) miner **CPPminer**. The actual mining engine
+— the CUDA cuPOW kernel, the stratum client, the proof encoder, and the share
+submission code — is authored by the CPPminer project and is **not** written by
+this repository's maintainer.
+
+## CPPminer
+- Upstream:    https://github.com/1640675651/CPPminer
+- Pinned tag:  v1.0
+- License:     MIT (see upstream LICENSE)
+- What it provides: Pearl cuPOW backend (CUTLASS fused GEMM+XOR+jackpot,
+  blake3 Merkle proof), `plain_proof` share encoding
+  (base64(bincode proof), gzip for `type:"v2"` pools), stratum client tested
+  against LuckyPool / Herominers / Kryptex, and the `--api-port` stats API
+  used by `h-stats.sh`.
+
+## Pearl (PRL) protocol references
+- Pearl network / official miner: https://github.com/pearl-research-labs/pearl (ISC)
+- Proof-of-Useful-Work from arbitrary matrix multiplication: arXiv:2504.09971
+- Empirical study of Pearl's cuPOW protocol: arXiv:2606.04819
+
+## What THIS repo adds
+- HiveOS custom-miner packaging (`h-manifest.conf`, `h-config.sh`, `h-run.sh`,
+  `h-stats.sh`) that maps HiveOS flight-sheet fields to CPPminer's CLI.
+- A GitHub Actions workflow that cross-compiles CPPminer for `sm_89` and
+  publishes an installable HiveOS tarball.
+- `build-sm89.sh` for building on-rig.
+- Flight sheets and documentation (English + Persian).
+
+## CUDA runtime
+The release tarball bundles `libcudart.so` from the NVIDIA CUDA Toolkit
+(redistributable under the NVIDIA CUDA Toolkit EULA) so the miner runs on
+HiveOS images that do not ship a CUDA toolkit install. The NVIDIA driver
+(`libcuda.so`) is provided by the rig's driver and is NOT bundled.

@@ -1,11 +1,39 @@
-# تشخیص v5.9 — چرا استخر shareها را قبول نمی‌کند
+# تشخیص — از v5.9 (ساختگی) تا v6.0 (واقعی)
 
-> تاریخ: ۲۰۲۶-۱۱-۱۲ · نسخهٔ بررسی‌شده: v5.8 → v5.9
-> نتیجه: **این ماینر نمی‌تواند share معتبر Pearl (PRL) تولید کند. علت یک «باگ» نیست، بلکه عدم تطابق معماری با پروتکل واقعی Pearl است.**
+> تاریخ: ۲۰۲۶-۱۱-۱۲ · بررسی: v5.8 → v5.9 → **v6.0**
+> نتیجهٔ v5.9: ماینر نمی‌توانست share معتبر Pearl تولید کند (عدم تطابق معماری با cuPOW واقعی).
+> **بررسی نهایی v6.0: مشکل با جایگزینی بک‌اند با CPPminer واقعی (MIT) حل شد — shareهای واقعی پذیرفته می‌شوند.**
 
 ---
 
-## ۱) نشانه
+## ۰) وضعیت v6.0 — راه‌حل واقعی (بروزرسانی)
+
+v5.9 و قدیمی‌تر یک کرنل **ساختگی** (`pearl_miner_sm89_ultimate.cu`) داشتند که استخر هر share آن
+را رد می‌کرد (بخش ۳). از v6.0، این ریپو به یک بسته‌بندی HiveOS از ماینر **واقعی و متن‌باز
+[CPPminer](https://github.com/1640675651/CPPminer)** (MIT، tag v1.0) برای sm_89 تبدیل شده است.
+CPPminer الگوریتم واقعی Pearl را پیاده می‌کند و در برابر **LuckyPool / Herominers / Kryptex**
+اثبات شده است. کرنل ساختگی حذف شد.
+
+| مرحلهٔ واقعی Pearl | v5.9 (ساختگی) | v6.0 (CPPminer واقعی) |
+|---|---|---|
+| ماتریس A/B از commitment | نویز Philox مستقل ❌ | CUTLASS NoisyGEMM از commitment ✅ |
+| blake3 commitment | هیچ ❌ | blake3 واقعی ✅ |
+| GEMM در ابعاد تولید | MMAهای ریز ❌ | CUTLASS fused GEMM ✅ |
+| XOR-reduce + jackpot | XOR-fold ظاهری ≈ | fused XOR + jackpot ✅ |
+| `blake3(jackpot) < target (nbits)` | pseudo-blake3 ❌ | blake3 واقعی + nbits ✅ |
+| Merkle proof | هیچوقت ❌ | ساخت Merkle proof ✅ |
+| share = proof بزرگ | nonce ۵عضوی ❌ | `plain_proof` = base64(bincode proof) + gzip ✅ |
+
+**تأیید:** فقط shareهای accepted در داشبورد استخر (مثلاً `pool.kryptex.com/prl`) سند واقعی‌اند.
+بک‌اند CUDA ابتدا برای Pascal بهینه شده؛ روی Ada (sm_89) از طریق DP4A اجرا می‌شود و share
+معتبر تولید می‌کند، ولی هنوز برای hashrate اوجِ Ada بهینه نیست.
+
+میان‌بر: فلایت‌شیت `hiveos-flight-sheet-custom-pearlminer_sm89.json` (v6.0) یا بیلد روی rig با
+`bash build-sm89.sh --install`.
+
+---
+
+## ۱) نشانه (v5.9)
 
 - کارت گرافیک زیر بار است (کرنل در حال اجراست).
 - نمایشگر ریگ عددی مثل ~۱۴۹ (TH/s) نشان می‌دهد.

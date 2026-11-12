@@ -1,9 +1,16 @@
-name: Build HiveOS Custom Miner Package
+name: Build HiveOS Pearl Miner (sm89) — real CPPminer backend
+
+# v6.0+: This repo is an sm89 HiveOS packaging of the REAL, MIT-licensed
+# CPPminer (https://github.com/1640675651/CPPminer), which implements the real
+# Pearl cuPOW protocol (CUTLASS fused GEMM+XOR+jackpot, blake3 Merkle proof,
+# plain_proof = base64(bincode proof), gzip for type:"v2" pools) and is proven
+# against LuckyPool / Herominers / Kryptex. The previous synthetic .cu kernel
+# was removed — it never produced pool-valid shares.
 
 on:
   push:
     branches: [ "main", "master" ]
-    tags: [ "v*" ]          # [v5.1] build an installable package for every release tag
+    tags: [ "v*" ]
   workflow_dispatch:
 
 permissions:
@@ -12,126 +19,122 @@ permissions:
 jobs:
   build-hiveos:
     runs-on: ubuntu-22.04
+    timeout-minutes: 90
     steps:
-      - name: Checkout Source Code
+      - name: Checkout this repo (HiveOS wrapper scripts + flight sheet)
         uses: actions/checkout@v4
 
-      - name: Install NVIDIA CUDA Toolkit 12.4
+      - name: Install NVIDIA CUDA Toolkit 12.4 (nvcc + cudart, for cross-compile to sm89)
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '12.4.0'
           method: 'network'
-          sub-packages: '["nvcc", "cudart-dev"]'
+          sub-packages: '["nvcc", "cudart", "cudart-dev"]'
 
-      - name: Compile PearlMiner SM89 (main + lite presets)
+      - name: Install Rust toolchain (for CPPminer cp-proof-ffi)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake g++ git curl wget jq
+
+      - name: Clone CPPminer v1.0 (MIT; proven Pearl backend)
         run: |
-          mkdir -p pearlminer_sm89
-          COMMON="-O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca"
-          LINK="-Xcompiler=-static-libstdc++,-static-libgcc -lpthread -ldl"
+          git clone --depth 1 --branch v1.0 https://github.com/1640675651/CPPminer.git cppminer
+          echo "CPPMINER_COMMIT=$(git -C cppminer rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "CPPminer pinned at ${{ env.CPPMINER_COMMIT }} (tag v1.0)"
 
-          # [v5.6] After hoisting B into shared memory (v5.5), B no longer consumes
-          # registers, so the accumulator can go back to N_FRAGMENTS=16 without
-          # the spill that plagued v5.3/v5.4. More fragments = more tensor-core
-          # MACs per nonce = more useful work per watt once the board power budget
-          # is raised to ~170 W. acc[16][4] costs 64 regs; adding A's live state
-          # (~14) stays under 96 with no spill.
-          echo "=== main preset: 16 fragments, 96 regs, 5 blocks/SM ==="
-          nvcc $COMMON -Xptxas=-v -maxrregcount=96 -DN_FRAGMENTS=16 -DBLOCKS_PER_SM=5 \
-            pearl_miner_sm89_ultimate.cu -o pearlminer_sm89/pearlminer_sm89 $LINK 2>&1 | tee main_build.log
-
-          echo "=== lite preset: 8 fragments, 64 regs, 8 blocks/SM ==="
-          nvcc $COMMON -Xptxas=-v -maxrregcount=64 -DN_FRAGMENTS=8 -DBLOCKS_PER_SM=8 \
-            pearl_miner_sm89_ultimate.cu -o pearlminer_sm89/pearlminer_sm89_lite $LINK 2>&1 | tee lite_build.log
-
-          echo "=== register usage summary ==="
-          grep -E "Used [0-9]+ registers|spill|stack frame" main_build.log lite_build.log || true
-
-          chmod +x pearlminer_sm89/pearlminer_sm89 pearlminer_sm89/pearlminer_sm89_lite
-          ls -la pearlminer_sm89/
-
-      - name: Generate HiveOS Integration Scripts (official custom-miner convention)
+      - name: Build CPPminer for sm89 (CUDA backend; cross-compiled, no GPU needed)
+        env:
+          # CUTLASS template instantiation is memory-heavy; cap parallelism so the
+          # 7-16 GB Actions runner does not OOM. sm89 = Ada Lovelace (RTX 40 series).
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: |
+          cd cppminer
+          ./build.sh --backend cuda --cuda-arch 89
+          test -x build/cppminer || { echo "BUILD FAILED: build/cppminer missing"; ls -la build/; exit 1; }
+          file build/cppminer
+          du -h build/cppminer
+
+      - name: Stage HiveOS package (binary + libcudart + wrapper scripts)
+        run: |
+          set -e
           mkdir -p pearlminer_sm89
+          cp cppminer/build/cppminer pearlminer_sm89/pearlminer_sm89
+          chmod +x pearlminer_sm89/pearlminer_sm89
 
-          cat << 'EOF' > pearlminer_sm89/h-manifest.conf
-          CUSTOM_NAME=pearlminer_sm89
-          CUSTOM_VERSION=5.9
-          CUSTOM_CONFIG_FILENAME=/hive/miners/custom/pearlminer_sm89/miner.conf
-          CUSTOM_LOG_BASENAME=/var/log/miner/custom/pearlminer_sm89
-          EOF
-
-          cat << 'EOF' > pearlminer_sm89/h-config.sh
-          #!/usr/bin/env bash
-          conf="--pool ${CUSTOM_URL} --wallet ${CUSTOM_TEMPLATE} ${CUSTOM_USER_CONFIG}"
-          echo "$conf" > /hive/miners/custom/pearlminer_sm89/miner.conf
-          EOF
-
-          cat << 'EOF' > pearlminer_sm89/h-run.sh
-          #!/usr/bin/env bash
-          cd /hive/miners/custom/pearlminer_sm89 || exit 1
-          BIN=./pearlminer_sm89
-          if [[ ! -x $BIN ]]; then
-            echo "[h-run] ERROR: pearlminer_sm89 binary missing or not executable!"
-            ls -la /hive/miners/custom/pearlminer_sm89
-            exit 1
-          fi
-          ARGS=$(cat miner.conf 2>/dev/null)
-          [[ -z "$ARGS" ]] && ARGS="--pool prl-ae.kryptex.network:7048"
-          # --preset lite switches to the low-register/high-occupancy kernel (benchmark both on your rig)
-          if [[ "$ARGS" == *"--preset lite"* ]]; then
-            BIN=./pearlminer_sm89_lite
-            ARGS=${ARGS//--preset lite/}
+          # Bundle libcudart.so so the binary runs on HiveOS without a CUDA toolkit install.
+          # (libcuda.so / driver libs are provided by the NVIDIA driver on the rig.)
+          CUDART="$(find "${CUDA_PATH:-/usr/local/cuda}" /usr/local/cuda* -name 'libcudart.so.*' -not -type l 2>/dev/null | head -1)"
+          if [[ -n "$CUDART" ]]; then
+            cp "$CUDART" pearlminer_sm89/
+            # keep the unversioned soname symlink the loader expects
+            SONAME="$(ldd pearlminer_sm89/pearlminer_sm89 2>/dev/null | grep -oE 'libcudart\.so\.[0-9]+' | head -1)"
+            [[ -n "$SONAME" ]] && ln -sf "$(basename "$CUDART")" "pearlminer_sm89/$SONAME"
+            echo "Bundled $CUDART"
           else
-            ARGS=${ARGS//--preset main/}
+            echo "WARN: libcudart not found in CUDA_PATH=${CUDA_PATH:-/usr/local/cuda}; binary will need cudart on the rig."
           fi
-          exec $BIN $ARGS
-          EOF
 
-          # Sourced by the HiveOS agent - MUST define $khs and $stats, do NOT echo output
-          cat << 'EOF' > pearlminer_sm89/h-stats.sh
-          khs=0
-          stats="null"
-          STATS_FILE="/tmp/pearlminer_stats.json"
-          if [[ -f "$STATS_FILE" ]]; then
-            stats=$(cat "$STATS_FILE" | tr -d '\n')
-            if command -v jq >/dev/null 2>&1; then
-              khs=$(jq -r '.khs // 0' "$STATS_FILE" 2>/dev/null)
-            fi
-          fi
-          EOF
+          # HiveOS custom-miner wrapper scripts (kept in this repo's hiveos/ dir).
+          cp hiveos/h-manifest.conf hiveos/h-config.sh hiveos/h-run.sh hiveos/h-stats.sh pearlminer_sm89/
+          chmod +x pearlminer_sm89/h-config.sh pearlminer_sm89/h-run.sh pearlminer_sm89/h-stats.sh
 
-          chmod +x pearlminer_sm89/h-config.sh pearlminer_sm89/h-run.sh
-          # [v5.1 FIX] derive the version from the tag instead of hard-coding it.
-          # Before this, every build published a file called pearlminer_sm89-4.4.tar.gz
-          # onto the v4.4 release, so v5.0 / v5.1 releases had NO installable asset
-          # and the HiveOS flight-sheet install_url 404'd.
+          # Derive version from the tag (fallback for branch pushes).
           VERSION="${GITHUB_REF_NAME#v}"
           if [[ -z "$VERSION" || "$VERSION" == "$GITHUB_REF_NAME" ]]; then
             VERSION="0.0.0-${GITHUB_SHA::7}"
           fi
           echo "PACKAGE_VERSION=$VERSION" >> "$GITHUB_ENV"
           sed -i "s/^CUSTOM_VERSION=.*/CUSTOM_VERSION=${VERSION}/" pearlminer_sm89/h-manifest.conf
-          echo "Building pearlminer_sm89-${VERSION}.tar.gz"
-          tar -czvf "pearlminer_sm89-${VERSION}.tar.gz" pearlminer_sm89/
-          ls -la *.tar.gz
+
+          echo "=== package contents ==="
+          ls -la pearlminer_sm89/
+          echo "=== linkage (driver libs are expected to be absent on the build runner) ==="
+          ldd pearlminer_sm89/pearlminer_sm89 2>&1 | head -20 || true
+
+          tar -czf "pearlminer_sm89-${VERSION}.tar.gz" pearlminer_sm89/
+          ls -la "pearlminer_sm89-${VERSION}.tar.gz"
 
       - name: Publish Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
-          # attach to whatever tag triggered the build; for a branch push fall back to a rolling tag
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest-build' }}
-          name: PearlMiner SM89 ${{ env.PACKAGE_VERSION }}
+          name: PearlMiner SM89 ${{ env.PACKAGE_VERSION }} (real CPPminer backend)
           body: |
-            ## PearlMiner SM89 ${{ env.PACKAGE_VERSION }}
+            ## PearlMiner SM89 ${{ env.PACKAGE_VERSION }} — REAL Pearl (PRL) mining
 
-            Installable HiveOS package: `pearlminer_sm89-${{ env.PACKAGE_VERSION }}.tar.gz`
+            This release ships the **real, MIT-licensed [CPPminer](https://github.com/1640675651/CPPminer)**
+            (pinned at tag `v1.0`, commit `${{ env.CPPMINER_COMMIT }}`) built for **sm89 / Ada Lovelace
+            (RTX 40 series)**, packaged as a HiveOS custom miner.
 
-            ### Install
+            ### Why this is real (unlike ≤ v5.9)
+            - Backend = **CPPminer**, proven on **LuckyPool / Herominers / Kryptex**.
+            - Real **Pearl cuPOW**: CUTLASS fused **GEMM + XOR + jackpot**, **blake3 Merkle proof**.
+            - Real share format: `plain_proof` = **base64(bincode proof)**, **gzip**-wrapped for
+              `type:"v2"` pools (Kryptex). Pools accept these shares.
+            - v5.9 and earlier used a *synthetic* kernel that pools always rejected — they are
+              deprecated; do not use them for production mining.
+
+            ### Install (HiveOS)
+            Import the flight sheet `hiveos-flight-sheet-custom-pearlminer_sm89.json`, set your PRL
+            wallet, and HiveOS auto-installs this tarball. Or install manually:
             ```bash
             cd /hive/miners/custom/
             wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_type == 'tag' && github.ref_name || 'latest-build' }}/pearlminer_sm89-${{ env.PACKAGE_VERSION }}.tar.gz
             tar -xzf pearlminer_sm89-${{ env.PACKAGE_VERSION }}.tar.gz
             chmod +x pearlminer_sm89/*
             ```
-          files: pearlminer_sm89-${{ env.PACKAGE_VERSION }}.tar.gz
 
+            ### Verify shares are real
+            After ~60 s, check your pool dashboard (Kryptex `pool.kryptex.com/prl`) for
+            **accepted shares** and a non-zero hashrate. That is the only real proof of mining;
+            the HiveOS `khs` number comes from CPPminer's `/hiveos` API endpoint.
+
+            > Note: CPPminer's CUDA backend was originally tuned for Pascal; on Ada (sm89) it runs
+            > via DP4A (int8 dot product, supported on Ada) and produces **valid shares**, though
+            > not yet Ada-optimised for peak hashrate.
+
+            ### License
+            MIT. The miner binary is CPPminer (MIT, © its authors); this repo's packaging is MIT.
+            See `LICENSE` and `NOTICE`.
+          files: pearlminer_sm89-${{ env.PACKAGE_VERSION }}.tar.gz

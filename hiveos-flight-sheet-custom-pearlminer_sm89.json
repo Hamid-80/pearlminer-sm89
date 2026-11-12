@@ -14,11 +14,11 @@
       "miner_config": {
         "url": "prl-ae.kryptex.network:7048",
         "algo": "pearlhash",
-        "pass": "x",
+        "pass": "d=2097152",
         "miner": "pearlminer_sm89",
         "template": "%WAL%.%WORKER_NAME%",
-        "install_url": "https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.9/pearlminer_sm89-5.9.tar.gz",
-        "user_config": "--pool %CUSTOM_URL% --wallet %CUSTOM_TEMPLATE% --cclock 2730 --stats-file /tmp/pearlminer_stats.json"
+        "install_url": "https://github.com/Hamid-80/pearlminer-sm89/releases/download/v6.0/pearlminer_sm89-6.0.tar.gz",
+        "user_config": ""
       },
       "pool_geo": []
     }

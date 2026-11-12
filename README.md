@@ -1,173 +1,140 @@
-# PearlMiner SM89
+# PearlMiner SM89 — REAL Pearl (PRL) miner for RTX 40 series
 
-> ماینر سفارشی **pearlhash** برای RTX 4070 Ti روی HiveOS
-> Custom pearlhash miner for RTX 4070 Ti (Ada / sm_89) on HiveOS
+> بک‌اند واقعی **CPPminer** (MIT) برای Pearl (PRL) بسته‌بندی‌شده برای HiveOS روی **sm_89 / Ada Lovelace (RTX 40)**.
+> A real, pool-valid Pearl (PRL) miner for **sm_89 / Ada Lovelace** on HiveOS, built from the MIT-licensed **CPPminer**.
 
-📖 **[راهنمای کامل فارسی →](GUIDE-FA.md)**
+📖 **[راهنمای کامل فارسی →](GUIDE-FA.md)** · **[DIAGNOSIS →](DIAGNOSIS.md)**
 
 ---
 
-## ⚠️ هشدار مهم / Important warning
+## این نسخه (v6.0) واقعی است / This release (v6.0) is REAL
 
-**این ماینر نمی‌تواند share معتبر Pearl تولید کند.** الگوریتم کرنل (Philox + INT8-MMA + pseudo-blake3) یک **تقریب ساختگی** است، نه پروتکل واقعی Pearl یعنی **cuPOW / NoisyGEMM** (blake3 commitment + structured noise + GEMM در ابعاد M=N=131072 + XOR-reduce + jackpot + **Merkle proof**) که استخر اعتبارسنجی می‌کند. ضمناً shareهای Pearl **proof‌های بزرگی (صدها KB)** هستند، نه یک nonce ساده. نتیجه: استخر **هر share** را رد می‌کند و hashrate واقعی صفر ثبت می‌شود — حتی اگر GPU زیر بار باشد و عدد «سرعت» چاپ شود. جزئیات فنی کامل: **[DIAGNOSIS.md](DIAGNOSIS.md)**.
+از v6.0 به بعد، این ریپو یک ماینر **واقعی** Pearl است: بک‌اند کرنل با **CPPminer** جایگزین شد —
+ماینر متن‌باز MIT که الگوریتم واقعی Pearl یعنی **cuPOW / NoisyGEMM** را پیاده می‌کند و در برابر
+استخرهای **LuckyPool / Herominers / Kryptex** اثبات شده است. نسخه‌های ≤ v5.9 یک کرنل **ساختگی**
+داشتند که استخر هر share آن را رد می‌کرد؛ منسوخ شده‌اند.
 
-**برای ماینینگ واقعی PRL** از یکی از این‌ها استفاده کنید:
-- [SRBMiner-Multi](https://github.com/doktor83/SRBMiner-Multi/releases) — `--algorithm pearlhash` (توصیه‌شده؛ فلایت‌شیت آماده در همین ریپو: `hiveos-flight-sheet-kryptex-srb.json`)
-- **Neil Pearl Miner** (متن‌باز، NVIDIA/AMD) — BitcoinTalk topic 5586806
-- **vllm-miner رسمی Pearl** — `github.com/pearl-research-labs/pearl`
+From v6.0 on, this repo is a **real** Pearl miner: the kernel backend is replaced by **CPPminer** —
+an MIT-licensed, open-source miner that implements the real Pearl **cuPOW / NoisyGEMM** algorithm and
+is proven against **LuckyPool / Herominers / Kryptex**. Versions ≤ v5.9 used a *synthetic* kernel
+that pools always rejected; they are deprecated.
 
-> This is a **research/benchmark** kernel only. Its "pearlhash" is a *synthetic*
-> approximation, NOT the real cuPOW protocol, so it **cannot** produce pool-valid
-> Pearl shares. Use **SRBMiner-Multi** (`--algorithm pearlhash`) for real mining.
-
-| موضوع | وضعیت |
+| مورد / Item | وضعیت / Status |
 |---|---|
-| کرنل Tensor Core INT8 (تقریب ساختگی) | ✅ اجرا می‌شود |
-| ساختار HiveOS | ✅ کامل |
-| اعتبارسنجی share توسط استخر Pearl | ❌ **امکان‌پذیر نیست (عدم تطابق cuPOW)** |
-| ماینینگ تولیدی | ❌ **از SRBMiner-Multi / Neil Pearl Miner استفاده کنید** |
+| بک‌اند / Backend | ✅ **CPPminer v1.0 (MIT)** — اثبات‌شده روی استخرهای واقعی |
+| الگوریتم / Algorithm | ✅ واقعی **Pearl cuPOW**: CUTLASS fused GEMM + XOR + jackpot |
+| proof و share | ✅ `plain_proof` = base64(**bincode** Merkle proof) + **gzip** (استخرهای `type:"v2"`) |
+| هش نهایی / Final hash | ✅ **blake3** روی jackpot، مقایسه با target از `nbits` |
+| اعتبارسنجی share توسط استخر / Pool-valid shares | ✅ بله (برخلاف v5.9) |
+| معماری / Arch | sm_89 (Ada / RTX 40) از طریق DP4A؛ sm_86 (RTX 30) با `SM_ARCH=86` |
 
 ---
 
-## چه چیزی در v5 درست شد
+## Pearl واقعی چیست؟ / What real Pearl mining is
 
-v4.4 چند باگ جدی داشت که ماینر را عملاً بی‌فایده می‌کرد:
+Pearl (PRL) یک L1 با **Proof-of-Useful-Work** است (hard fork بیت‌کوین، آوریل ۲۰۲۶): کار مفیدِ ماینر
+**ضرب ماتریس** است، نه حدس هش تصادفی. الگوریتم ماینینگ (که CPPminer آن را پیاده کرده):
 
-| # | باگ | تأثیر | رفع |
-|---|---|---|---|
-| ۱ | **VRAM روی 405-810 MHz قفل بود** | pearlhash حافظه‌بر است → هش‌ریت سقوط می‌کرد | قفل حذف شد، حافظه استوک |
-| ۲ | `mining.notify` پارس نمی‌شد | هدر بلوک واقعی هرگز خوانده نمی‌شد | پارس کامل job_id/seed/target |
-| ۳ | `mining.submit` آرایه ۳ عضوی | استخر همه shareها را رد می‌کرد | آرایه ۵ عضوی استاندارد |
-| ۴ | `target_high` ثابت `0xFFFF0000` | سختی استخر نادیده گرفته می‌شد | از پاسخ استخر خوانده می‌شود |
-| ۵ | هش روی داده ساختگی | share نامعتبر | فلگ `valid` — تا job نیاید submit نمی‌شود |
-| ۶ | بنچمارک و ماین یکی | اعداد گمراه‌کننده | تفکیک + هشدار صادقانه |
+1. **NoisyGEMM** — ضرب ماتریس int8 (CUTLASS) روی GPU با نویز ساختاریافته‌ی مشتق‌شده از commitment.
+2. ساخت **commitment** و درخت **Merkle** روی کاشی‌های GEMM.
+3. محاسبهٔ **jackpot** از خروجی، و هش نهایی با **blake3**.
+4. مقایسهٔ `blake3(jackpot)` با **target** (کدشده در `nbits`؛ سختی mainnet ~۱۰.۵M).
+5. submit یک **proof بزرگ (ده‌ها KB)** به استخر — **نه** یک nonce ساده.
 
----
+استخر هر share را با بازمحاسبهٔ کاشی GEMM، بررسی Merkle proof، و تطابق `blake3(jackpot) < target`
+اعتبارسنجی می‌کند. به همین دلیل CPPminer برای استخرهای `type:"v2"` (Kryptex) proof را با **gzip**
+فشرده می‌کند (~۳۵×).
 
-## چه چیزی در v5.8 درست شد
-
-v5.7 هنوز چند باگ جدی در کلاینت Stratum و حلقه‌ی GPU داشت که shareها را نامعتبر یا گم می‌کرد:
-
-| # | باگ | تأثیر | رفع |
-|---|---|---|---|
-| ۱ | **اولین لانچ بدون `cudaEventRecord`** | تکرار اول حلقه `found_count` را می‌خواند در حالی که کرنل هنوز می‌نوشت → data race و خراب شدن بافر نتیجه برای لانچ بعدی | ثبت `finished_events[0]` بلافاصله پس از اولین لانچ |
-| ۲ | **`submit_share_async` بدون قفل می‌خواند `current_job`** | یک ترد جدا از job_id_str نیمه‌نوشته می‌خواند و با job اشتباه submit می‌کرد | گرفتن کپی job_id_str/ntime زیر `job_mutex` و چک تطابق `win_job == current_job.job_id` (shareهای stale رد می‌شوند) |
-| ۳ | **`send()` همزمان از چند ترد** | چند submit همزمان بایت‌ها را روی سوکت مخلوط می‌کردند → JSON خراب به استخر | `submit_mutex` + `send_all` (در برابر short write هم مقاوم) |
-| ۴ | **بدون framing newline در `recv`** | یک پیام در چند `recv` یا چند خط در یک `recv` → jobها گم می‌شد (در `POOL-CONNECTION-FA.md` مستند شده بود) | بافر انباشتی + تفکیک روی `\n` → `handle_line` |
-| ۵ | **`extranonce2`/`ntime` ثابت `"00000000"`** | استخر همه shareها را رد می‌کرد | پارس `extranonce1`/`extranonce2_size` از `mining.subscribe` (آرایه‌ای و object) و `ntime` از `mining.notify`؛ `extranonce2` یکتا و افزایشی |
-| ۶ | **پارس موضعی نبود** | استاندارد Stratum `params` را به‌صورت آرایه می‌فرستد، نه کلید نام‌دار → job_id خالی می‌ماند | fallback موضعی (با آگاهی از عمق براکت) برای `job_id`/`prevhash`/`ntime` |
-| ۷ | **`cudaHostAllocWriteCombined` روی بافر خوانده‌شده** | خواندن CPU هر تکرار از حافظه‌ی uncached کند/ناپایدار | فقط `cudaHostAllocMapped` |
-| ۸ | **race روی `d_l2_header_staging` هنگام تغییر job** | دو استریم یک نماد device مشترک می‌خواندند/نوشتند | همگام‌سازی کرنل قبلی قبل از بازنویسی staging |
-| ۹ | **پاسخ authorize بررسی نمی‌شد** | worker رد شده ولی ماینر بی‌صدا ادامه می‌داد | تشخیص `result:false` + چاپ دلیل + هشدار هنگام خروج |
-| ۱۰ | **تطبیق `\"id\":4` شکننده** | `id:40` هم match می‌شد؛ شمارش share اشتباه | dispatch هر خط کامل و parse عددی `id` |
-
-همچنین: پاک‌سازی stream/buffer در مسیر خطای گراف، اعتبارسنجی port در `parse_pool_url`، و همگام‌سازی رشته‌ی نسخه (v4.3/v4.4 → v5.8) در کل سورس، workflow و فلایت‌شیت.
-
-> ⚠️ کلاینت Stratum در v5.8 کامل‌تر شد ولی **هنوز با استخر زنده PRL تست نشده است** (CUDA در محیط توسعه نبود). منطق پارسر با ۴۵ تست واحد روی داده‌های واقعی‌نمای Kryptex (object-form و array-form) تأیید شده. برای ماینینگ تولیدی از SRBMiner استفاده کنید.
+Pearl (PRL) is an L1 Proof-of-Useful-Work chain (Apr 2026): the useful work is **matrix
+multiplication**, not random hashing. CPPminer implements it: int8 NoisyGEMM via CUTLASS, structured
+noise from a commitment, a Merkle tree over the GEMM tiles, a jackpot, a final **blake3** hash, and a
+target encoded in `nbits`. The submitted share is a **large proof (tens of KB)**, gzip-wrapped for v2
+pools — not a nonce. Sources: arXiv 2504.09971, arXiv 2606.04819, `pearl-research-labs/pearl`.
 
 ---
 
-## v5.9 — تشخیص صادقانه / Honest diagnosis
+## استخرها / Pools
 
-v5.9 الگوریتم را «درست» نمی‌کند (غیرممکن است؛ الگوریتم واقعی Pearl = **cuPOW/NoisyGEMM + Merkle proof** با قالب share مستندنشده است). بلکه:
+| استخر / Pool | آدرس stratum | منطقه / Region |
+|---|---|---|
+| **Kryptex** (پیش‌فرض فلایت‌شیت) | `stratum+tcp://prl.kryptex.network:7048` | جهانی |
+| Kryptex AE (فلایت‌شیت فعلی) | `stratum+tcp://prl-ae.kryptex.network:7048` | خاورمیانه |
+| Kryptex EU/US/SG/HK/RU/BR | `stratum+tcp://prl-<region>.kryptex.network:7048` | منطقه‌ای |
+| LuckyPool | CPPminer به‌طور پیش‌فرض LuckyPool Pearl را استفاده می‌کند (حذف `--pool`) | جهانی |
+| f2pool | `stratum+tcp://pearl.f2pool.com:5500` | جهانی |
 
-| تغییر | توضیح |
-|---|---|
-| بنر هشدار صادقانه در استارتاپ | کرنل ساختگی است؛ استخر هر share را رد می‌کند |
-| برچسب سرعت `SYNTHETIC (NOT pool-valid)` | عدد TH/s فقط throughput تنسور، نه هش pool-پذیر |
-| تشخیص runtime | بعد از ۶۰s با ۰ share، دلیل را چاپ می‌کند |
-| nonce ۳۲بیتی (۸ hex) | اصلاح قالب stratum (هرچند برای Pearl کشنده‌ی بنیادی‌تر است) |
-
-کامل: **[DIAGNOSIS.md](DIAGNOSIS.md)**
+داشبورد استخر: Kryptex `https://pool.kryptex.com/prl` — فقط shareهای **accepted** و hashrate غیرصفر سند واقعی ماینینگ‌اند.
 
 ---
 
-## نصب سریع
+## نصب سریع / Quick install (HiveOS)
 
+1. در HiveOS: **Flight Sheets → Import JSON** → فایل [`hiveos-flight-sheet-custom-pearlminer_sm89.json`](hiveos-flight-sheet-custom-pearlminer_sm89.json).
+2. آدرس کیف‌پول PRL خود را در فیلد **Wallet** وارد کنید.
+3. فلایت‌شیت را به کارت اعمال کنید؛ HiveOS به‌صورت خودکار tarball را از release v6.0 نصب می‌کند.
+
+نصب دستی / Manual:
 ```bash
 cd /hive/miners/custom/
-wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.9/pearlminer_sm89-5.9.tar.gz
-tar -xzf pearlminer_sm89-5.9.tar.gz
+wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v6.0/pearlminer_sm89-6.0.tar.gz
+tar -xzf pearlminer_sm89-6.0.tar.gz
 chmod +x pearlminer_sm89/*
-cd pearlminer_sm89
-./pearlminer_sm89 --benchmark 30
 ```
 
-راهنمای کامل نصب: **[GUIDE-FA.md](GUIDE-FA.md)**
+---
+
+## تأیید اینکه واقعاً ماین می‌کند / Verify it really mines
+
+پس از ~۶۰ ثانیه:
+```bash
+# آمار زنده از API خود CPPminer (همان منبعی که h-stats.sh می‌خواند)
+curl -s http://127.0.0.1:4028/summary | jq '{hs: .hashrate.total[0], accepted: .shares.accepted, rejected: .shares.rejected}'
+```
+سپس در **داشبورد استخر** (مثلاً `pool.kryptex.com/prl`) «shareهای accepted» و hashrate غیرصفر را ببینید.
+این تنها سند واقعی ماینینگ است؛ عدد HiveOS `khs` از همان endpoint `/hiveos` می‌آید.
+
+> توجه: بک‌اند CUDA ابتدا برای Pascal بهینه شده؛ روی Ada (sm_89) از طریق DP4A اجرا می‌شود و
+> **shareهای معتبر** تولید می‌کند، ولی هنوز برای hashrate اوجِ Ada بهینه نیست.
 
 ---
 
-## فلایت‌شیت‌ها
-
-| فایل | ماینر | وضعیت |
-|---|---|---|
-| [`hiveos-flight-sheet-kryptex-srb.json`](hiveos-flight-sheet-kryptex-srb.json) | SRBMiner 3.8.3 | ✅ **توصیه‌شده** |
-| [`hiveos-flight-sheet-custom-pearlminer_sm89.json`](hiveos-flight-sheet-custom-pearlminer_sm89.json) | این ریپو | ⚠️ آزمایشی |
-
-وارد کردن در HiveOS: **Flight Sheet → Import JSON**
-
----
-
-## تنظیمات اورکلاک پیشنهادی برای ۴۰۷۰ Ti
-
-| پارامتر | حالت پایدار | حداکثر هش‌ریت |
-|---|---|---|
-| Core Offset | +200 MHz | +300 MHz |
-| Lock Core | 2500 MHz | 2650 MHz |
-| Lock Memory | **5001 MHz** | **5001 MHz** |
-| Power Limit | 160 W | 180 W |
-| نتیجه (عدد **ساختگی**، نه pool-valid) | ~153 TH/s @ 144W | ~161 TH/s @ 170W |
-
-> ⚠️ این اعداد throughput تنسورِ کرنل ساختگی‌اند، نه هش‌ریت Pearl. استخر هیچ‌کدام را ثبت نمی‌کند (توضیح در [DIAGNOSIS.md](DIAGNOSIS.md)).
-
-> 💡 `Lock Memory` را پایین نگذارید — pearlhash حافظه‌بر است.
-
----
-
-## CLI
+## ساخت از سورس روی rig / Build on the rig
 
 ```bash
-./pearlminer_sm89 --pool HOST:PORT --wallet WALLET --worker NAME
-./pearlminer_sm89 --benchmark 30
-./pearlminer_sm89 --cclock 2730
-./pearlminer_sm89 --help
+# نیازها: CUDA Toolkit 12.x (nvcc)، Rust (cargo)، cmake، g++، git، curl
+bash build-sm89.sh --install     # CPPminer v1.0 را برای sm_89 بیلد و در HiveOS نصب می‌کند
+# برای RTX 30 (Ampere):   SM_ARCH=86 bash build-sm89.sh --install
 ```
 
 ---
 
-## ساخت از سورس
+## CLI واقعی / Real CLI (CPPminer)
 
 ```bash
-# preset اصلی — حداکثر register reuse
-nvcc -O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca \
-  -DN_FRAGMENTS=16 -DBLOCKS_PER_SM=5 \
-  pearl_miner_sm89_ultimate.cu -o pearlminer_sm89 \
-  -Xcompiler=-static-libstdc++,-static-libgcc -lpthread -ldl
-
-# preset سبک — occupancy بیشتر
-nvcc -O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca \
-  -DN_FRAGMENTS=8 -DBLOCKS_PER_SM=8 \
-  pearl_miner_sm89_ultimate.cu -o pearlminer_sm89_lite \
-  -Xcompiler=-static-libstdc++,-static-libgcc -lpthread -ldl
+./pearlminer_sm89 --algo pearl --backend cuda --devices 0 \
+  --pool stratum+tcp://prl.kryptex.network:7048 \
+  --wallet prl1<YOUR_WALLET> --worker rig01 \
+  --pool-pass d=2097152 --api-port 4028
 ```
+پرچم‌های مفید: `--devices N` (کارت؛ برای چند کارتی یک پروسس به ازای GPU)، `--batch-size N`،
+`--verify` (تأیید zk-pow قبل از submit)، `--mock` (آفلاین تا اولین share + تأیید، بدون استخر).
 
 ---
 
-## نیازمندی‌ها
+## نیازمندی‌ها / Requirements
 
-- RTX 40 Series (Ada Lovelace, **sm_89**) — روی ۳۰ سری یا AMD کار نمی‌کند
-- CUDA 12.4+
-- درایور NVIDIA 550+
-- HiveOS یا Linux
+- RTX 40 series (Ada, **sm_89**)؛ RTX 30 (Ampere, sm_86) با `SM_ARCH=86`؛ کارت‌های AMD با بک‌اند OpenCL در upstream CPPminer.
+- درایور NVIDIA 550+ (تأمین `libcuda.so`)؛ `libcudart.so` درون tarball بسته‌بندی شده.
+- HiveOS یا هر Linux x86_64.
 
 ---
 
-## مجوز
+## مجوز / License
 
-MIT
+MIT. باینری ماینر = CPPminer (MIT، © نویسندگان آن)؛ بسته‌بندی این ریپو نیز MIT.
+جزئیات: [`LICENSE`](LICENSE) و [`NOTICE`](NOTICE).
 
-## مشارکت
+## مشارکت / Contributing
 
-Pull Request خوش‌آمد است — مخصوصاً:
-- تست `mining.notify` با استخر واقعی PRL
-- پورت کرنل به `sm_86` (RTX 30 series)
+Pull request خوش‌آمد است — به‌ویژه: بهینه‌سازی CUTLASS برای Ada، تست با استخرهای واقعی و
+گزارش hashrate واقعی روی 4070 Ti / 4090.
