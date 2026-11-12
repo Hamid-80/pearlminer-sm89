@@ -1,6 +1,10 @@
 // ============================================================================
 // File: pearl_miner_sm89_ultimate.cu
-// Version: v5.8 Cross-Platform (HiveOS Linux + Windows x64)
+// Version: v5.9 Cross-Platform (HiveOS Linux + Windows x64)
+//   v5.9: HONEST diagnostics — this kernel is a synthetic pearlhash
+//         approximation, NOT the real cuPOW NoisyGEMM + Merkle-proof
+//         protocol. It CANNOT produce pool-valid Pearl (PRL) shares.
+//         For real PRL mining use SRBMiner-MULTI or Neil Pearl Miner.
 // Target GPU: NVIDIA GeForce RTX 4070 Ti (Ada Lovelace - sm_89)
 // Default Pool: prl.kryptex.network:7048
 // Default Wallet: prl1p6zx47507v0xp8389u7rggjy4wmy02eaa6x8atnhtux3lc89mwgrqmte6lh
@@ -644,7 +648,7 @@ private:
             }
             printf("[Stratum] Authenticating worker: %s\n", full_user.c_str());
 
-            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/5.8\"]}\n";
+            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/5.9\"]}\n";
             std::string auth_msg = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + full_user + "\",\"x\"]}\n";
             // [v5.8] send_all avoids short writes that would corrupt the JSON line.
             // Serialize against concurrent submit threads that share this socket.
@@ -1079,11 +1083,17 @@ public:
         uint32_t e2 = extranonce2_counter.fetch_add(1, std::memory_order_relaxed);
 
         char nonce_hex[32];
-        snprintf(nonce_hex, sizeof(nonce_hex), "%016llx", (unsigned long long)winning_nonce);
+        // [v5.9] Standard stratum nonce is 32-bit (8 hex). A 64-bit / 16-hex
+        // nonce is rejected by pools as malformed. NOTE: Pearl (PRL) shares are
+        // actually large Merkle-proof objects, not a nonce — see DIAGNOSIS.md;
+        // this submit can never be pool-valid regardless of nonce width.
+        snprintf(nonce_hex, sizeof(nonce_hex), "%08x", (unsigned)(winning_nonce & 0xffffffffu));
         char e2_hex[33];
         snprintf(e2_hex, sizeof(e2_hex), "%0*x", en2_size * 2, e2);
 
-        printf("\n[SHARE FOUND!] Job #%s | Nonce: 0x%s | extranonce2: %s | ntime: %s | -> %s\n",
+        // [v5.9] Be honest: this "share" is a synthetic-kernel hit, not a real
+        // Pearl proof. The pool WILL reject it.
+        printf("\n[SHARE FOUND?] (synthetic kernel hit — pool WILL reject; not a valid Pearl proof)\n"               "        Job #%s | Nonce: 0x%s | extranonce2: %s | ntime: %s | -> %s\n",
                jid_str.c_str(), nonce_hex, e2_hex, ntime_hex.c_str(), host.c_str());
         fflush(stdout);
 
@@ -1227,13 +1237,33 @@ int main(int argc, char* argv[]) {
     }
 
     printf("====================================================================\n");
-    printf("  PearlHash SM89 Ultimate v5.8 (HiveOS & Windows - RTX 4070 Ti)\n");
+    printf("  PearlHash SM89 Ultimate v5.9 (HiveOS & Windows - RTX 4070 Ti)\n");
     printf("  Pool Address  : %s:%d\n", pool_host.c_str(), pool_port);
     printf("  Wallet Address: %s\n", wallet.c_str());
     printf("  GPU Index     : %d | Fragments: %d | Blocks/SM: %d\n",
            device_id, N_FRAGMENTS, BLOCKS_PER_SM);
     if (benchmark_secs > 0) printf("  Mode          : BENCHMARK (%d s, no pool)\n", benchmark_secs);
     printf("====================================================================\n\n");
+
+    // [v5.9] HONEST diagnostic banner. This project is a research/benchmark
+    // kernel. Its "pearlhash" is a synthetic Philox+INT8-MMA+pseudo-blake3
+    // approximation, NOT the real Pearl cuPOW protocol (NoisyGEMM + blake3
+    // commitment + Merkle proof). The pool verifies the real protocol, so it
+    // REJECTS every share this miner submits. 0 accepted shares is EXPECTED.
+    printf("====================================================================\n");
+    printf("  WARNING - RESEARCH/BENCHMARK KERNEL, NOT A VALID PEARL MINER\n");
+    printf("  This kernel computes a SYNTHETIC pearlhash approximation\n");
+    printf("  (Philox + INT8 MMA + pseudo-blake3), NOT the real Pearl cuPOW\n");
+    printf("  protocol (NoisyGEMM + blake3 commitment + Merkle proof).\n");
+    printf("  => The pool REJECTS every share this miner submits.\n");
+    printf("  => Speed below is SYNTHETIC tensor-op throughput, NOT\n");
+    printf("     pool-accepted hashes. 0 accepted shares is EXPECTED.\n");
+    printf("  For real PRL mining use one of:\n");
+    printf("    * SRBMiner-MULTI   --algorithm pearlhash  (recommended)\n");
+    printf("    * Neil Pearl Miner (open source, bitcointalk topic 5586806)\n");
+    printf("    * Official Pearl vllm-miner (pearl-research-labs/pearl)\n");
+    printf("====================================================================\n\n");
+    fflush(stdout);
 
 #ifdef _WIN32
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
@@ -1499,13 +1529,28 @@ int main(int argc, char* argv[]) {
             write_hiveos_telemetry(stats_file, terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
                                    uptime, miner.get_accepted(), miner.get_rejected());
 
-            printf("[Speed v5.8] %.2f TH/s | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u (stale %u)\n",
+            printf("[Speed v5.9] %.2f TH/s SYNTHETIC (NOT pool-valid) | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u (stale %u)\n",
                    terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
                    miner.get_accepted(), miner.get_rejected(), miner.get_stale());
             fflush(stdout);
 
             last_report_time = now;
             nonces_since_last_report = 0;
+
+            // [v5.9] Honest runtime diagnostic: after 60s of real-pool mining
+            // with zero accepted shares, say why (once).
+            static bool warned_zero_shares = false;
+            if (!warned_zero_shares && miner.has_real_job() &&
+                miner.get_accepted() == 0 && uptime > 60) {
+                warned_zero_shares = true;
+                printf("\n[DIAG] 0 shares accepted after 60s on a live pool. This is\n"
+                       "       EXPECTED: the kernel is a synthetic pearlhash\n"
+                       "       approximation, not the real cuPOW NoisyGEMM + Merkle-\n"
+                       "       proof protocol the pool verifies. It cannot produce\n"
+                       "       valid Pearl shares. Use SRBMiner-MULTI\n"
+                       "       (--algorithm pearlhash) or Neil Pearl Miner.\n\n");
+                fflush(stdout);
+            }
         }
 
         current_stream = next_stream;

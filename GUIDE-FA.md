@@ -59,10 +59,10 @@ ssh user@192.168.0.100
 
 # ۲. دانلود آخرین نسخه
 cd /hive/miners/custom/
-wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.8/pearlminer_sm89-5.8.tar.gz
+wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.9/pearlminer_sm89-5.9.tar.gz
 
 # ۳. استخراج
-tar -xzf pearlminer_sm89-5.8.tar.gz
+tar -xzf pearlminer_sm89-5.9.tar.gz
 
 # ۴. قابل اجرا کردن
 chmod +x pearlminer_sm89/pearlminer_sm89
@@ -116,7 +116,7 @@ nvcc -O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca \
 | Pool | `prl.kryptex.network:7048` |
 | Miner | `Custom` |
 | Name | `pearlminer_sm89` |
-| Install URL | `https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.8/pearlminer_sm89-5.8.tar.gz` |
+| Install URL | `https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.9/pearlminer_sm89-5.9.tar.gz` |
 | Template | `%WAL%.%WORKER_NAME%` |
 
 ۳. در **Setup Miner Config** وارد شو و در فیلد **User config** بنویس:

@@ -55,7 +55,7 @@ jobs:
 
           cat << 'EOF' > pearlminer_sm89/h-manifest.conf
           CUSTOM_NAME=pearlminer_sm89
-          CUSTOM_VERSION=5.8
+          CUSTOM_VERSION=5.9
           CUSTOM_CONFIG_FILENAME=/hive/miners/custom/pearlminer_sm89/miner.conf
           CUSTOM_LOG_BASENAME=/var/log/miner/custom/pearlminer_sm89
           EOF

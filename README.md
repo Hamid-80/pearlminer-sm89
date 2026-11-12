@@ -9,20 +9,23 @@
 
 ## ⚠️ هشدار مهم / Important warning
 
-**این پروژه برای پژوهش و یادگیری است، نه ماینینگ تولیدی.**
+**این ماینر نمی‌تواند share معتبر Pearl تولید کند.** الگوریتم کرنل (Philox + INT8-MMA + pseudo-blake3) یک **تقریب ساختگی** است، نه پروتکل واقعی Pearl یعنی **cuPOW / NoisyGEMM** (blake3 commitment + structured noise + GEMM در ابعاد M=N=131072 + XOR-reduce + jackpot + **Merkle proof**) که استخر اعتبارسنجی می‌کند. ضمناً shareهای Pearl **proof‌های بزرگی (صدها KB)** هستند، نه یک nonce ساده. نتیجه: استخر **هر share** را رد می‌کند و hashrate واقعی صفر ثبت می‌شود — حتی اگر GPU زیر بار باشد و عدد «سرعت» چاپ شود. جزئیات فنی کامل: **[DIAGNOSIS.md](DIAGNOSIS.md)**.
 
-**برای ماینینگ واقعی PRL از [SRBMiner-Multi](https://github.com/doktor83/SRBMiner-Multi/releases) استفاده کنید** — محصولی بالغ که سال‌ها بهینه و با استخرها تست شده است.
+**برای ماینینگ واقعی PRL** از یکی از این‌ها استفاده کنید:
+- [SRBMiner-Multi](https://github.com/doktor83/SRBMiner-Multi/releases) — `--algorithm pearlhash` (توصیه‌شده؛ فلایت‌شیت آماده در همین ریپو: `hiveos-flight-sheet-kryptex-srb.json`)
+- **Neil Pearl Miner** (متن‌باز، NVIDIA/AMD) — BitcoinTalk topic 5586806
+- **vllm-miner رسمی Pearl** — `github.com/pearl-research-labs/pearl`
 
-> This is a **research/benchmark** project, not a production miner.
-> For real PRL mining use **SRBMiner-Multi**. The Stratum client was improved
-> in v5 but has **not** been validated against a live pool.
+> This is a **research/benchmark** kernel only. Its "pearlhash" is a *synthetic*
+> approximation, NOT the real cuPOW protocol, so it **cannot** produce pool-valid
+> Pearl shares. Use **SRBMiner-Multi** (`--algorithm pearlhash`) for real mining.
 
 | موضوع | وضعیت |
 |---|---|
-| کرنل Tensor Core INT8 | ✅ کارا |
+| کرنل Tensor Core INT8 (تقریب ساختگی) | ✅ اجرا می‌شود |
 | ساختار HiveOS | ✅ کامل |
-| پروتکل Stratum | ⚠️ اصلاح‌شده اما تست‌نشده با استخر واقعی |
-| ماینینگ تولیدی | ❌ **از SRBMiner استفاده کنید** |
+| اعتبارسنجی share توسط استخر Pearl | ❌ **امکان‌پذیر نیست (عدم تطابق cuPOW)** |
+| ماینینگ تولیدی | ❌ **از SRBMiner-Multi / Neil Pearl Miner استفاده کنید** |
 
 ---
 
@@ -64,12 +67,27 @@ v5.7 هنوز چند باگ جدی در کلاینت Stratum و حلقه‌ی GP
 
 ---
 
+## v5.9 — تشخیص صادقانه / Honest diagnosis
+
+v5.9 الگوریتم را «درست» نمی‌کند (غیرممکن است؛ الگوریتم واقعی Pearl = **cuPOW/NoisyGEMM + Merkle proof** با قالب share مستندنشده است). بلکه:
+
+| تغییر | توضیح |
+|---|---|
+| بنر هشدار صادقانه در استارتاپ | کرنل ساختگی است؛ استخر هر share را رد می‌کند |
+| برچسب سرعت `SYNTHETIC (NOT pool-valid)` | عدد TH/s فقط throughput تنسور، نه هش pool-پذیر |
+| تشخیص runtime | بعد از ۶۰s با ۰ share، دلیل را چاپ می‌کند |
+| nonce ۳۲بیتی (۸ hex) | اصلاح قالب stratum (هرچند برای Pearl کشنده‌ی بنیادی‌تر است) |
+
+کامل: **[DIAGNOSIS.md](DIAGNOSIS.md)**
+
+---
+
 ## نصب سریع
 
 ```bash
 cd /hive/miners/custom/
-wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.8/pearlminer_sm89-5.8.tar.gz
-tar -xzf pearlminer_sm89-5.8.tar.gz
+wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.9/pearlminer_sm89-5.9.tar.gz
+tar -xzf pearlminer_sm89-5.9.tar.gz
 chmod +x pearlminer_sm89/*
 cd pearlminer_sm89
 ./pearlminer_sm89 --benchmark 30
@@ -98,7 +116,9 @@ cd pearlminer_sm89
 | Lock Core | 2500 MHz | 2650 MHz |
 | Lock Memory | **5001 MHz** | **5001 MHz** |
 | Power Limit | 160 W | 180 W |
-| نتیجه | ~153 TH/s @ 144W | ~161 TH/s @ 170W |
+| نتیجه (عدد **ساختگی**، نه pool-valid) | ~153 TH/s @ 144W | ~161 TH/s @ 170W |
+
+> ⚠️ این اعداد throughput تنسورِ کرنل ساختگی‌اند، نه هش‌ریت Pearl. استخر هیچ‌کدام را ثبت نمی‌کند (توضیح در [DIAGNOSIS.md](DIAGNOSIS.md)).
 
 > 💡 `Lock Memory` را پایین نگذارید — pearlhash حافظه‌بر است.
 
