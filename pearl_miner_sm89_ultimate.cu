@@ -1,16 +1,22 @@
 // ============================================================================
 // File: pearl_miner_sm89_ultimate.cu
-// Version: v4.3 Cross-Platform (HiveOS Linux + Windows x64)
+// Version: v5.8 Cross-Platform (HiveOS Linux + Windows x64)
 // Target GPU: NVIDIA GeForce RTX 4070 Ti (Ada Lovelace - sm_89)
 // Default Pool: prl.kryptex.network:7048
 // Default Wallet: prl1p6zx47507v0xp8389u7rggjy4wmy02eaa6x8atnhtux3lc89mwgrqmte6lh
 //
-// Linux / HiveOS Compile Command:
-// nvcc -O3 -arch=sm_89 --use_fast_math -maxrregcount=96 -Xptxas="-v,-dlcm=ca" pearl_miner_sm89_ultimate.cu -o pearlminer_sm89 -lpthread -ldl
+// Linux / HiveOS Compile Command (main preset):
+//   nvcc -O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca -maxrregcount=96
+//        -DN_FRAGMENTS=16 -DBLOCKS_PER_SM=5
+//        pearl_miner_sm89_ultimate.cu -o pearlminer_sm89
+//        -Xcompiler=-static-libstdc++,-static-libgcc -lpthread -ldl
 //
-// Windows Compile Command:
-// nvcc -O3 -arch=sm_89 --use_fast_math -maxrregcount=96 -Xptxas="-v,-dlcm=ca" pearl_miner_sm89_ultimate.cu -o pearl_miner_4070ti.exe -lws2_32
+// Windows Compile Command (main preset):
+//   nvcc -O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca -maxrregcount=96
+//        -DN_FRAGMENTS=16 -DBLOCKS_PER_SM=5
+//        pearl_miner_sm89_ultimate.cu -o pearlminer_4070ti.exe -lws2_32
 // ============================================================================
+
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -41,6 +47,7 @@ typedef int sock_t;
 #include <stdio.h>
 #include <string.h>
 #include <string>
+#include <vector>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -87,6 +94,7 @@ struct alignas(16) PearlJob {
     uint32_t extranonce2;
     bool     valid;               // [v5] set once a real mining.notify has been parsed
     char     job_id_str[64];      // [v5.7] raw job_id string the pool expects on submit
+    char     ntime_str[16];       // [v5.8] ntime from mining.notify, echoed back on submit
 };
 
 __constant__ uint32_t c_header_key[8];
@@ -565,11 +573,22 @@ private:
     std::string worker;
     std::atomic<bool> is_running{true};
     std::atomic<bool> is_connected{false};
+    std::atomic<bool> authorized{false};        // [v5.8] result of mining.authorize
+    std::atomic<bool> auth_replied{false};      // [v5.8] pool answered authorize at all
     std::atomic<uint32_t> accepted_shares{0};
     std::atomic<uint32_t> rejected_shares{0};
-    std::atomic<bool> notify_pending{false};   // [v5] a new job is ready to be pushed to the GPU
-    std::mutex job_mutex;
+    std::atomic<uint32_t> stale_shares{0};      // [v5.8] shares dropped because their job rolled over
+    std::atomic<bool> notify_pending{false};    // [v5] a new job is ready to be pushed to the GPU
+    std::mutex job_mutex;                       // guards current_job and the stratum session fields below
+    std::mutex submit_mutex;                    // [v5.8] serializes send() on the shared socket
     PearlJob current_job;
+    // [v5.8] Stratum session state parsed from mining.subscribe / mining.notify.
+    // v5.7 hard-coded extranonce2="00000000" and ntime="00000000" on every submit,
+    // which is why a live pool rejected every share. Hold the real values here.
+    std::string extranonce1;                    // pool-assigned, hex
+    int         extranonce2_size = 4;           // bytes (from subscribe)
+    std::atomic<uint32_t> extranonce2_counter{0};
+    std::string recv_buffer;                    // [v5.8] accumulating line buffer (TCP has no framing)
     sock_t sock = INVALID_SOCK;
 
     void close_socket() {
@@ -577,6 +596,19 @@ private:
             CLOSE_SOCK(sock);
             sock = INVALID_SOCK;
         }
+    }
+
+    // [v5.8] Robust send: loop until all bytes are written. A bare send() can do a
+    // short write, feeding the pool a truncated JSON line and getting the connection
+    // dropped.
+    static bool send_all(sock_t s, const char* data, int len) {
+        int sent = 0;
+        while (sent < len) {
+            int n = (int)send(s, data + sent, len - sent, 0);
+            if (n <= 0) return false;
+            sent += n;
+        }
+        return true;
     }
 
     void attempt_connect() {
@@ -612,10 +644,15 @@ private:
             }
             printf("[Stratum] Authenticating worker: %s\n", full_user.c_str());
 
-            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/4.4\"]}\n";
+            std::string sub_msg  = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"PearlSM89/5.8\"]}\n";
             std::string auth_msg = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + full_user + "\",\"x\"]}\n";
-            send(sock, sub_msg.c_str(), (int)sub_msg.size(), 0);
-            send(sock, auth_msg.c_str(), (int)auth_msg.size(), 0);
+            // [v5.8] send_all avoids short writes that would corrupt the JSON line.
+            // Serialize against concurrent submit threads that share this socket.
+            {
+                std::lock_guard<std::mutex> slk(submit_mutex);
+                send_all(sock, sub_msg.c_str(), (int)sub_msg.size());
+                send_all(sock, auth_msg.c_str(), (int)auth_msg.size());
+            }
 
             std::thread(&PearlStratumMiner::listen_loop, this).detach();
         } else {
@@ -646,6 +683,7 @@ public:
         current_job.target_high = 0x00000000FFFF0000ULL;
         current_job.job_id = 1;
         snprintf(current_job.job_id_str, sizeof(current_job.job_id_str), "1");
+        snprintf(current_job.ntime_str, sizeof(current_job.ntime_str), "00000000");
         // [v5] No real job yet: hashes computed before a mining.notify arrives are
         // synthetic and must never be submitted to the pool.
         current_job.valid = false;
@@ -672,18 +710,51 @@ public:
             if (n <= 0) {
                 printf("\n[Stratum] Disconnected from pool.\n");
                 is_connected.store(false);
+                recv_buffer.clear();
                 close_socket();
                 break;
             }
-            buf[n] = '\0';
-            std::string line(buf, (size_t)n);
-            if (line.find("mining.notify") != std::string::npos) {
-                handle_notify(line);
-            } else if (line.find("\"id\":4") != std::string::npos) {
-                if (line.find("\"result\":true") != std::string::npos) accepted_shares++;
-                else rejected_shares++;
+            // [v5.8] Append to the line buffer; TCP does not preserve message
+            // boundaries, so one recv may return a partial JSON line, a whole line,
+            // or several lines at once. The old code did a raw substring search on
+            // whatever recv returned and silently dropped split / multi-line messages
+            // (documented as a known bug in POOL-CONNECTION-FA.md). Splitting on '\n'
+            // is the only correct framing for the newline-delimited Stratum protocol.
+            recv_buffer.append(buf, (size_t)n);
+            for (;;) {
+                size_t nl = recv_buffer.find('\n');
+                if (nl == std::string::npos) break;
+                std::string line = recv_buffer.substr(0, nl);
+                recv_buffer.erase(0, nl + 1);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty()) handle_line(line);
             }
         }
+    }
+
+    // [v5.8] Dispatch one complete Stratum line to the right handler.
+    void handle_line(const std::string& line) {
+        if (line.find("\"mining.notify\"") != std::string::npos) {
+            handle_notify(line);
+            return;
+        }
+        if (line.find("\"mining.set_difficulty\"") != std::string::npos) {
+            // The toy 64-bit kernel target is derived from the notify target; explicit
+            // difficulty retargets are noted but not applied.
+            printf("[Stratum] (mining.set_difficulty received; not applied to 64-bit kernel)\n");
+            fflush(stdout);
+            return;
+        }
+        if (line.find("\"mining.set_extranonce\"") != std::string::npos) {
+            handle_set_extranonce(line);
+            return;
+        }
+        // Response lines carry an "id" matching a request we sent.
+        int id = json_find_int(line, "id");
+        if (id == 1) { handle_subscribe_response(line); return; }
+        if (id == 2) { handle_authorize_response(line); return; }
+        if (id == 4) { handle_submit_response(line);   return; }
+        // Unknown / unsolicited line: ignore.
     }
 
     // [v5 FIX] v4.4 hashed the raw stratum bytes into a fake header_key and left
@@ -718,6 +789,182 @@ public:
         return v;
     }
 
+    // [v5.8] Extract an integer value for a JSON key. Accepts both "k":123 and
+    // "k":"123" (some pools return extranonce2_size as a string). Returns -1 if the
+    // key/value is absent or not numeric.
+    static int json_find_int(const std::string& s, const std::string& key) {
+        std::string pat = "\"" + key + "\"";
+        size_t p = s.find(pat);
+        if (p == std::string::npos) return -1;
+        p = s.find(':', p + pat.size());
+        if (p == std::string::npos) return -1;
+        ++p;
+        while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) ++p;
+        bool neg = false;
+        if (p < s.size() && s[p] == '-') { neg = true; ++p; }
+        if (p < s.size() && s[p] == '"') ++p;   // tolerate quoted numbers
+        int v = 0; bool any = false;
+        while (p < s.size() && s[p] >= '0' && s[p] <= '9') {
+            v = v * 10 + (s[p] - '0');
+            ++p; any = true;
+        }
+        if (!any) return -1;
+        return neg ? -v : v;
+    }
+
+    // [v5.8] mining.subscribe reply: result = [[ "extranonce1", extranonce2_size ],
+    // sub_id] (array form) or { "extranonce1": "...", "extranonce2_size": N } (object
+    // form used by some pools). json_find_* walks the raw text, so both shapes work.
+    // [v5.8] Extract the top-level quoted strings inside the "params":[...] array,
+    // skipping any nested arrays/objects (e.g. merkle_branch). Used as a positional
+    // fallback for pools that send mining.notify in the standard array form
+    //   params = [ job_id, prevhash, coinbase1, coinbase2, merkle[], version, nbits,
+    //              ntime, clean_jobs ]
+    // instead of the object form with named keys. Returns an empty vector when params
+    // is an object (no '['), in which case the named-key path above is authoritative.
+    static std::vector<std::string> extract_array_strings(const std::string& s) {
+        std::vector<std::string> out;
+        size_t kp = s.find("\"params\"");
+        if (kp == std::string::npos) return out;
+        size_t lb = s.find('[', kp);
+        if (lb == std::string::npos) return out;
+        size_t i = lb + 1;
+        int depth = 0;
+        while (i < s.size()) {
+            char c = s[i];
+            if (c == '"') {
+                size_t e = i + 1;
+                while (e < s.size() && s[e] != '"') {
+                    if (s[e] == '\\') ++e;   // skip escaped char
+                    ++e;
+                }
+                if (e >= s.size()) break;
+                if (depth == 0) out.push_back(s.substr(i + 1, e - i - 1));
+                i = e + 1;
+            } else if (c == '[' || c == '{') {
+                ++depth; ++i;
+            } else if (c == ']' || c == '}') {
+                if (depth == 0) break;
+                --depth; ++i;
+            } else {
+                ++i;
+            }
+        }
+        return out;
+    }
+
+    // [v5.8] True when s is exactly 8 hex characters (typical ntime/version width).
+    static bool looks_hex8(const std::string& s) {
+        if (s.size() != 8) return false;
+        for (char c : s) {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+                return false;
+        }
+        return true;
+    }
+
+    // [v5.8] mining.subscribe reply comes in two shapes:
+    //   array form (standard):    {"id":1,"result":[["<en1>",<en2_size>],"<sub_id>"],...}
+    //   object form (some pools): {"id":1,"result":{"extranonce1":"<en1>","extranonce2_size":N}}
+    // The old code only read named keys, so on the standard array form it silently kept
+    // en2_size=4 and an empty extranonce1. Handle both.
+    void handle_subscribe_response(const std::string& line) {
+        std::string en1;
+        int sz = json_find_int(line, "extranonce2_size");
+        if (sz <= 0) sz = json_find_int(line, "extranonce2-length");
+        if (sz <= 0) sz = json_find_int(line, "extranonce2_size_bytes");
+        json_find_string(line, "extranonce1", en1);   // object form
+
+        // Array form: en1 is the first quoted string inside "result"; en2_size is the
+        // bare integer immediately following it inside the inner ["en1",N] pair.
+        if (en1.empty()) {
+            size_t rp = line.find("\"result\"");
+            if (rp != std::string::npos) {
+                size_t q2 = line.find('"', rp);            // opening quote of "result"
+                q2 = (q2 == std::string::npos) ? std::string::npos : line.find('"', q2 + 1); // closing quote of key
+                size_t q3 = (q2 == std::string::npos) ? std::string::npos : line.find('"', q2 + 1); // opening quote of en1
+                if (q3 != std::string::npos) {
+                    size_t q4 = line.find('"', q3 + 1);    // closing quote of en1
+                    if (q4 != std::string::npos) {
+                        en1 = line.substr(q3 + 1, q4 - q3 - 1);
+                        if (sz <= 0) {
+                            size_t p = q4 + 1;
+                            while (p < line.size() && (line[p]==' '||line[p]==','||line[p]=='\t')) ++p;
+                            bool neg = false;
+                            if (p < line.size() && line[p] == '-') { neg = true; ++p; }
+                            int v = 0; bool any = false;
+                            while (p < line.size() && line[p] >= '0' && line[p] <= '9') {
+                                v = v * 10 + (line[p] - '0'); ++p; any = true;
+                            }
+                            if (any) sz = neg ? -v : v;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!en1.empty()) {
+            std::lock_guard<std::mutex> lk(job_mutex);
+            extranonce1 = en1;
+            printf("[Stratum] extranonce1=%s\n", en1.c_str());
+        }
+        if (sz > 0 && sz <= 16) {
+            std::lock_guard<std::mutex> lk(job_mutex);
+            extranonce2_size = sz;
+            printf("[Stratum] extranonce2_size=%d bytes\n", sz);
+        }
+        fflush(stdout);
+    }
+
+    // [v5.8] mining.set_extranonce: a live pool may rotate extranonce1 mid-session.
+    void handle_set_extranonce(const std::string& line) {
+        std::string en1;
+        if (json_find_string(line, "extranonce1", en1)) {
+            std::lock_guard<std::mutex> lk(job_mutex);
+            extranonce1 = en1;
+            printf("[Stratum] extranonce1 updated via mining.set_extranonce\n");
+            fflush(stdout);
+        }
+    }
+
+    // [v5.8] mining.authorize reply: detect a rejected worker instead of mining
+    // silently forever against a socket that never sends jobs.
+    void handle_authorize_response(const std::string& line) {
+        auth_replied.store(true);
+        bool ok = line.find("\"result\":true") != std::string::npos ||
+                  line.find("\"result\": true") != std::string::npos;
+        std::string err;
+        bool has_err = json_find_string(line, "message", err) ||
+                       json_find_string(line, "error", err);
+        if (ok && !has_err) {
+            authorized.store(true);
+            printf("[Stratum] Authorized.\n");
+        } else {
+            authorized.store(false);
+            printf("[Stratum] Authorization FAILED (worker rejected by pool).%s%s\n",
+                   err.empty() ? "" : " Reason: ", err.c_str());
+        }
+        fflush(stdout);
+    }
+
+    // [v5.8] mining.submit reply: accept only on result:true with no error message.
+    // A non-null "error"/"message" means rejected even alongside result:false.
+    void handle_submit_response(const std::string& line) {
+        bool ok = line.find("\"result\":true") != std::string::npos ||
+                  line.find("\"result\": true") != std::string::npos;
+        std::string err;
+        bool has_err = json_find_string(line, "message", err) ||
+                       json_find_string(line, "error", err);
+        if (ok && !has_err) {
+            accepted_shares.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            rejected_shares.fetch_add(1, std::memory_order_relaxed);
+            printf("[Stratum] Share rejected.%s%s\n",
+                   err.empty() ? "" : " Reason: ", err.c_str());
+            fflush(stdout);
+        }
+    }
+
     void handle_notify(const std::string& line) {
         std::lock_guard<std::mutex> lk(job_mutex);
         std::string jid, seed, tgt;
@@ -726,6 +973,29 @@ public:
             if (!json_find_string(line, "seed", seed))
                 json_find_string(line, "header", seed);
         json_find_string(line, "target", tgt);
+        // [v5.8] ntime is mandatory for a valid mining.submit; the pool echoes a stale
+        // share rejection if it is missing or sent as "00000000".
+        std::string ntime;
+        if (!json_find_string(line, "ntime", ntime))
+            json_find_string(line, "time", ntime);
+
+        // [v5.8] Positional fallback for array-form mining.notify. Standard Stratum
+        // sends params as a positional array, not a named-key object; without this
+        // fallback the old parser silently left job_id empty and submitted a bogus
+        // numeric id. job_id is reliably params[0]; prevhash params[1]; ntime is the
+        // last 8-hex-char token in the array (typical ntime width).
+        if (jid.empty()) {
+            std::vector<std::string> ps = extract_array_strings(line);
+            if (!ps.empty()) {
+                if (jid.empty())   jid = ps[0];
+                if (seed.empty() && ps.size() > 1) seed = ps[1];
+                if (ntime.empty()) {
+                    for (auto it = ps.rbegin(); it != ps.rend(); ++it) {
+                        if (looks_hex8(*it)) { ntime = *it; break; }
+                    }
+                }
+            }
+        }
 
         if (jid.size() >= 2) {
             // [v5.7 FIX] Kryptex sends job_id like "58d5fbb2_4194304". The old
@@ -755,10 +1025,16 @@ public:
             // 0x00000000000003ff which keeps the difficulty ordering correct.
             current_job.target_high = hex64(tgt.substr(0, 16));
         }
+        if (!ntime.empty()) {
+            snprintf(current_job.ntime_str, sizeof(current_job.ntime_str), "%s", ntime.c_str());
+        } else {
+            snprintf(current_job.ntime_str, sizeof(current_job.ntime_str), "00000000");
+        }
         current_job.valid = true;
         notify_pending.store(true);
-        printf("[Stratum] New job #%u | target 0x%016llx\n",
-               current_job.job_id, (unsigned long long)current_job.target_high);
+        printf("[Stratum] New job #%u | target 0x%016llx | ntime %s\n",
+               current_job.job_id, (unsigned long long)current_job.target_high,
+               current_job.ntime_str);
         fflush(stdout);
     }
 
@@ -773,27 +1049,58 @@ public:
     // restarting the whole miner, and tells it whether shares are worth submitting.
     bool consume_notify() { return notify_pending.exchange(false); }
     bool has_real_job() const { return current_job.valid; }
+    uint32_t get_stale() const { return stale_shares.load(); }
+    bool is_authorized() const { return authorized.load(); }
 
-    void submit_share_async(uint64_t winning_nonce, uint32_t job_id) {
+    // [v5.8] Submit a share mined under `win_job` (the kernel's hashed job id).
+    // Captures the matching job_id_str + ntime under the job lock so a detached
+    // submit thread never reads half-written state, and refuses to submit a stale
+    // share whose job has already rolled over (the pool would reject it anyway).
+    // Sends under submit_mutex so concurrent submit threads cannot interleave bytes.
+    bool submit_share(uint64_t winning_nonce, uint32_t win_job) {
+        std::string jid_str, ntime_hex;
+        {
+            std::lock_guard<std::mutex> lk(job_mutex);
+            if (current_job.job_id != win_job) {
+                stale_shares.fetch_add(1, std::memory_order_relaxed);
+                printf("\n[SHARE] Job #%u stale (active job #%u) — not submitted.\n",
+                       (unsigned)win_job, (unsigned)current_job.job_id);
+                fflush(stdout);
+                return false;
+            }
+            jid_str   = current_job.job_id_str;
+            ntime_hex = current_job.ntime_str;
+        }
+
+        // Monotonic extranonce2 so every share on this connection is unique, as the
+        // stratum protocol requires. Width = extranonce2_size bytes (hex).
+        int en2_size = extranonce2_size > 0 ? extranonce2_size : 4;
+        if (en2_size > 16) en2_size = 16;
+        uint32_t e2 = extranonce2_counter.fetch_add(1, std::memory_order_relaxed);
+
         char nonce_hex[32];
         snprintf(nonce_hex, sizeof(nonce_hex), "%016llx", (unsigned long long)winning_nonce);
-        // [v5.7] Read the raw job_id string for the CURRENT job; the pool echoes
-        // it back verbatim, so submit with the original ("58d5fbb2_4194304").
-        std::string jid_str(current_job.job_id_str);
-        printf("\n[SHARE FOUND!] Job #%s | Nonce: 0x%s | Submitting to %s...\n",
-               jid_str.c_str(), nonce_hex, host.c_str());
+        char e2_hex[33];
+        snprintf(e2_hex, sizeof(e2_hex), "%0*x", en2_size * 2, e2);
 
-        if (is_connected.load() && sock != INVALID_SOCK) {
-            std::string full_user = wallet;
-            if (!worker.empty() && wallet.find('.') == std::string::npos) {
-                full_user += "." + worker;
-            }
-            std::string submit_msg =
-                "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"" +
-                full_user + "\",\"" + jid_str + "\",\"00000000\",\"00000000\",\"" +
-                std::string(nonce_hex) + "\"]}\n";
-            send(sock, submit_msg.c_str(), (int)submit_msg.size(), 0);
+        printf("\n[SHARE FOUND!] Job #%s | Nonce: 0x%s | extranonce2: %s | ntime: %s | -> %s\n",
+               jid_str.c_str(), nonce_hex, e2_hex, ntime_hex.c_str(), host.c_str());
+        fflush(stdout);
+
+        if (!is_connected.load() || sock == INVALID_SOCK) return false;
+
+        std::string full_user = wallet;
+        if (!worker.empty() && wallet.find('.') == std::string::npos) {
+            full_user += "." + worker;
         }
+        // Standard 5-element mining.submit: [worker, job_id, extranonce2, ntime, nonce]
+        std::string submit_msg =
+            "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"" +
+            full_user + "\",\"" + jid_str + "\",\"" + std::string(e2_hex) + "\",\"" +
+            ntime_hex + "\",\"" + std::string(nonce_hex) + "\"]}\n";
+
+        std::lock_guard<std::mutex> slk(submit_mutex);
+        return send_all(sock, submit_msg.c_str(), (int)submit_msg.size());
     }
 };
 
@@ -821,10 +1128,20 @@ void parse_pool_url(const std::string& input, std::string& out_host, int& out_po
     std::string clean = input;
     size_t pos = clean.find("://");
     if (pos != std::string::npos) clean = clean.substr(pos + 3);
-    size_t colon = clean.find(':');
+    // [v5.8] Strip a trailing path or whitespace that HiveOS templates sometimes
+    // append (e.g. "host:port/" or "host:port "), which atoi used to turn into port 0.
+    size_t slash = clean.find('/');
+    if (slash != std::string::npos) clean = clean.substr(0, slash);
+    while (!clean.empty() && (clean.back() == ' ' || clean.back() == '\t' ||
+                              clean.back() == '\r' || clean.back() == '\n')) {
+        clean.pop_back();
+    }
+    size_t colon = clean.rfind(':');
     if (colon != std::string::npos) {
         out_host = clean.substr(0, colon);
-        out_port = atoi(clean.substr(colon + 1).c_str());
+        int p = atoi(clean.substr(colon + 1).c_str());
+        // [v5.8] Reject nonsense ports instead of silently connecting on port 0.
+        if (p > 0 && p <= 65535) out_port = p;
     } else {
         out_host = clean;
     }
@@ -910,7 +1227,7 @@ int main(int argc, char* argv[]) {
     }
 
     printf("====================================================================\n");
-    printf("  PearlHash SM89 Ultimate v4.4 (HiveOS & Windows - RTX 4070 Ti)\n");
+    printf("  PearlHash SM89 Ultimate v5.8 (HiveOS & Windows - RTX 4070 Ti)\n");
     printf("  Pool Address  : %s:%d\n", pool_host.c_str(), pool_port);
     printf("  Wallet Address: %s\n", wallet.c_str());
     printf("  GPU Index     : %d | Fragments: %d | Blocks/SM: %d\n",
@@ -942,7 +1259,8 @@ int main(int argc, char* argv[]) {
 
     printf("[GPU %d] Device Name       : %s\n", device_id, props.name);
     printf("[GPU %d] Compute Capability: sm_%d%d (%d SMs | %d MB L2 Cache | VRAM Deep-Sleep)\n",
-           device_id, props.major, props.minor, props.multiProcessorCount, props.l2CacheSize / (1024 * 1024));
+           device_id, props.major, props.minor, props.multiProcessorCount,
+           (int)(props.l2CacheSize / (1024 * 1024)));
 
     if (props.major != 8 || props.minor != 9) {
         printf("[Warning] This binary contains ONLY sm_89 SASS code, but this GPU is sm_%d%d.\n",
@@ -982,7 +1300,11 @@ int main(int argc, char* argv[]) {
     cudaEvent_t  finished_events[2];   // [v5.1 PERF] per-stream completion marker
 
     for (int s = 0; s < 2; ++s) {
-        cudaHostAlloc((void**)&h_results[s], sizeof(ShareResult), cudaHostAllocMapped | cudaHostAllocWriteCombined);
+        // [v5.8] Drop cudaHostAllocWriteCombined: the host reads found_count and the
+        // winning nonce array out of this buffer every iteration, but write-combined
+        // memory is uncached on the CPU side (slow, and on some drivers unreliable to
+        // read back). Mapped-only stays coherent for GPU->CPU and is fast to read.
+        cudaHostAlloc((void**)&h_results[s], sizeof(ShareResult), cudaHostAllocMapped);
         cudaHostGetDevicePointer((void**)&d_results[s], (void*)h_results[s], 0);
         memset((void*)h_results[s], 0, sizeof(ShareResult));
         cudaStreamCreateWithFlags(&streams[s], cudaStreamNonBlocking);
@@ -1045,6 +1367,14 @@ int main(int argc, char* argv[]) {
         if (g_err != cudaSuccess) {
             printf("[CUDA Error] Graph creation failed: %s\n", cudaGetErrorString(g_err));
             printf("[CUDA Error] Aborting (see warning about sm_89 above).\n");
+            // [v5.8] Free the streams / host buffers / graphs already allocated above
+            // instead of leaking them on the error path.
+            for (int s = 0; s < 2; ++s) {
+                if (graph_execs[s]) cudaGraphExecDestroy(graph_execs[s]);
+                if (graphs[s])      cudaGraphDestroy(graphs[s]);
+                if (streams[s])     cudaStreamDestroy(streams[s]);
+                if (h_results[s])   cudaFreeHost(h_results[s]);
+            }
             g_nvml_ctrl.restore_defaults();
             return -1;
         }
@@ -1066,6 +1396,13 @@ int main(int argc, char* argv[]) {
     graph_job_id[0]      = job0.job_id;
     cudaGraphExecKernelNodeSetParams(graph_execs[0], kernel_nodes[0], &node_params[0]);
     cudaGraphLaunch(graph_execs[0], streams[0]);
+    // [v5.8 FIX] Record the completion event for the very first launch. The mining
+    // loop's first iteration calls cudaEventSynchronize(finished_events[current_stream])
+    // (= finished_events[0]) BEFORE any later launch records it; an unrecorded event
+    // returns immediately, so the host read found_count while the kernel was still
+    // writing -> data race and a corrupted result buffer for the next launch on that
+    // stream. Recording here makes the first sync wait for real completion.
+    cudaEventRecord(finished_events[0], streams[0]);
 
     int current_stream = 0;
 
@@ -1077,6 +1414,14 @@ int main(int argc, char* argv[]) {
         nonce_cursor += nonces_per_launch;
 
         if (next_job.job_id != last_seen_job_id) {
+            // [v5.8 FIX] d_l2_header_staging is a single device symbol shared by both
+            // streams. The previous launch (still running on current_stream until we
+            // sync it) reads it via cp.async at kernel start; overwriting it from
+            // next_stream right now would race with that read. Wait for the previous
+            // kernel to finish reading before issuing the overwrite. The later sync
+            // below then completes instantly. (Only on job change — every other
+            // iteration keeps full double-buffer overlap.)
+            cudaEventSynchronize(finished_events[current_stream]);
             cudaMemcpyToSymbolAsync(d_l2_header_staging, next_job.header_key, sizeof(uint32_t) * 8, 0, cudaMemcpyHostToDevice, streams[next_stream]);
             last_seen_job_id = next_job.job_id;
         }
@@ -1118,8 +1463,12 @@ int main(int argc, char* argv[]) {
             for (uint32_t i = 0; i < count; ++i) {
                 uint64_t win_nonce = h_results[current_stream]->winning_nonces[i];
                 uint32_t win_job   = h_results[current_stream]->job_ids[i];
+                // [v5.8] Do not spin up submit threads for synthetic benchmark work
+                // (no real mining.notify ever arrived) — submit_share would only drop
+                // them as stale or, worse, send synthetic shares to a live pool.
+                if (!miner.has_real_job()) continue;
                 std::thread([&miner, win_nonce, win_job]() {
-                    miner.submit_share_async(win_nonce, win_job);
+                    miner.submit_share(win_nonce, win_job);
                 }).detach();
             }
         }
@@ -1150,9 +1499,9 @@ int main(int argc, char* argv[]) {
             write_hiveos_telemetry(stats_file, terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
                                    uptime, miner.get_accepted(), miner.get_rejected());
 
-            printf("[Speed v4.4] %.2f TH/s | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u\n",
+            printf("[Speed v5.8] %.2f TH/s | Temp: %u\u00b0C | Fan: %u%% | Power: %.1fW | Shares: %u/%u (stale %u)\n",
                    terahashes_per_sec, gpu_temp, gpu_fan, gpu_power,
-                   miner.get_accepted(), miner.get_rejected());
+                   miner.get_accepted(), miner.get_rejected(), miner.get_stale());
             fflush(stdout);
 
             last_report_time = now;
@@ -1185,11 +1534,16 @@ int main(int argc, char* argv[]) {
                "not pool-accepted shares. Use SRBMiner for production PRL mining.\n");
         fflush(stdout);
     } else {
-        printf("\n[Mining] Shutting down. Accepted: %u  Rejected: %u\n",
-               miner.get_accepted(), miner.get_rejected());
+        printf("\n[Mining] Shutting down. Accepted: %u  Rejected: %u  Stale: %u  (authorized: %s)\n",
+               miner.get_accepted(), miner.get_rejected(), miner.get_stale(),
+               miner.is_authorized() ? "yes" : "no");
         if (!miner.has_real_job()) {
             printf("[Mining] WARNING: no valid mining.notify was ever received - "
                    "this run produced no real work.\n");
+        }
+        if (miner.has_real_job() && !miner.is_authorized()) {
+            printf("[Mining] WARNING: pool never authorized the worker - check the "
+                   "wallet/worker string and that the pool supports plain stratum.\n");
         }
         fflush(stdout);
     }

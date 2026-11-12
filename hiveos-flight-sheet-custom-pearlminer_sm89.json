@@ -17,7 +17,7 @@
         "pass": "x",
         "miner": "pearlminer_sm89",
         "template": "%WAL%.%WORKER_NAME%",
-        "install_url": "https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.1/pearlminer_sm89-5.1.tar.gz",
+        "install_url": "https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.8/pearlminer_sm89-5.8.tar.gz",
         "user_config": "--pool %CUSTOM_URL% --wallet %CUSTOM_TEMPLATE% --cclock 2730 --stats-file /tmp/pearlminer_stats.json"
       },
       "pool_geo": []

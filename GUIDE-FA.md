@@ -59,10 +59,10 @@ ssh user@192.168.0.100
 
 # ۲. دانلود آخرین نسخه
 cd /hive/miners/custom/
-wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.0/pearlminer_sm89-5.0.tar.gz
+wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.8/pearlminer_sm89-5.8.tar.gz
 
 # ۳. استخراج
-tar -xzf pearlminer_sm89-5.0.tar.gz
+tar -xzf pearlminer_sm89-5.8.tar.gz
 
 # ۴. قابل اجرا کردن
 chmod +x pearlminer_sm89/pearlminer_sm89
@@ -116,7 +116,7 @@ nvcc -O3 -arch=sm_89 --use_fast_math -Xptxas=-dlcm=ca \
 | Pool | `prl.kryptex.network:7048` |
 | Miner | `Custom` |
 | Name | `pearlminer_sm89` |
-| Install URL | `https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.0/pearlminer_sm89-5.0.tar.gz` |
+| Install URL | `https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.8/pearlminer_sm89-5.8.tar.gz` |
 | Template | `%WAL%.%WORKER_NAME%` |
 
 ۳. در **Setup Miner Config** وارد شو و در فیلد **User config** بنویس:
@@ -227,6 +227,20 @@ Power Limit       : 150   W
 - گزارش وضعیت در زمان خروج (accepted/rejected)
 - هشدار صریح اگر هیچ job واقعی دریافت نشد
 - کامنت‌گذاری شفاف درباره‌ی ماهیت بنچمارک
+
+### 🐛 رفع‌های v5.8 (مرحله‌ی بعدی)
+
+v5.7 هنوز باگ‌های واقعی در کلاینت Stratum و حلقه‌ی GPU داشت:
+
+- **اولین لانچ بدون event**: تکرار اول حلقه نتیجه را بدون همگام‌سازی می‌خواند (data race). اکنون `finished_events[0]` ثبت می‌شود.
+- **data race در submit**: `submit_share_async` بدون قفل `current_job` را می‌خواند و با job اشتباه submit می‌کرد. اکنون کپی زیر قفل و چک stale.
+- **`send()` همزمان**: چند ترد بایت‌ها را مخلوط می‌کردند. اکنون `submit_mutex` + `send_all`.
+- **framing newline**: `recv` بدون تفکیک `\n` jobها را گم می‌کرد. اکنون بافر انباشتی + `handle_line`.
+- **extranonce2/ntime ثابت**: استخر همه shareها را رد می‌کرد. اکنون از `mining.subscribe`/`mining.notify` پارس و یکتا ارسال می‌شود.
+- **پارس موضعی**: استاندارد Stratum آرایه می‌فرستد نه کلید نام‌دار. fallback موضعی (depth-aware) اضافه شد.
+- **`WriteCombined`** از بافر خوانده‌شده حذف شد؛ **race روی staging** هنگام تغییر job رفع شد؛ **پاسخ authorize** بررسی می‌شود؛ مسیر خطای گراف پاک‌سازی می‌کند.
+
+> منطق پارسر با ۴۵ تست واحد روی داده‌های واقعی‌نمای Kryptex (هم object-form هم array-form) تأیید شده. ولی همچنان با استخر زنده تست نشده — برای تولید از SRBMiner استفاده کنید.
 
 ---
 

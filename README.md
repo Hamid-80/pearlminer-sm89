@@ -41,12 +41,35 @@ v4.4 چند باگ جدی داشت که ماینر را عملاً بی‌فای
 
 ---
 
+## چه چیزی در v5.8 درست شد
+
+v5.7 هنوز چند باگ جدی در کلاینت Stratum و حلقه‌ی GPU داشت که shareها را نامعتبر یا گم می‌کرد:
+
+| # | باگ | تأثیر | رفع |
+|---|---|---|---|
+| ۱ | **اولین لانچ بدون `cudaEventRecord`** | تکرار اول حلقه `found_count` را می‌خواند در حالی که کرنل هنوز می‌نوشت → data race و خراب شدن بافر نتیجه برای لانچ بعدی | ثبت `finished_events[0]` بلافاصله پس از اولین لانچ |
+| ۲ | **`submit_share_async` بدون قفل می‌خواند `current_job`** | یک ترد جدا از job_id_str نیمه‌نوشته می‌خواند و با job اشتباه submit می‌کرد | گرفتن کپی job_id_str/ntime زیر `job_mutex` و چک تطابق `win_job == current_job.job_id` (shareهای stale رد می‌شوند) |
+| ۳ | **`send()` همزمان از چند ترد** | چند submit همزمان بایت‌ها را روی سوکت مخلوط می‌کردند → JSON خراب به استخر | `submit_mutex` + `send_all` (در برابر short write هم مقاوم) |
+| ۴ | **بدون framing newline در `recv`** | یک پیام در چند `recv` یا چند خط در یک `recv` → jobها گم می‌شد (در `POOL-CONNECTION-FA.md` مستند شده بود) | بافر انباشتی + تفکیک روی `\n` → `handle_line` |
+| ۵ | **`extranonce2`/`ntime` ثابت `"00000000"`** | استخر همه shareها را رد می‌کرد | پارس `extranonce1`/`extranonce2_size` از `mining.subscribe` (آرایه‌ای و object) و `ntime` از `mining.notify`؛ `extranonce2` یکتا و افزایشی |
+| ۶ | **پارس موضعی نبود** | استاندارد Stratum `params` را به‌صورت آرایه می‌فرستد، نه کلید نام‌دار → job_id خالی می‌ماند | fallback موضعی (با آگاهی از عمق براکت) برای `job_id`/`prevhash`/`ntime` |
+| ۷ | **`cudaHostAllocWriteCombined` روی بافر خوانده‌شده** | خواندن CPU هر تکرار از حافظه‌ی uncached کند/ناپایدار | فقط `cudaHostAllocMapped` |
+| ۸ | **race روی `d_l2_header_staging` هنگام تغییر job** | دو استریم یک نماد device مشترک می‌خواندند/نوشتند | همگام‌سازی کرنل قبلی قبل از بازنویسی staging |
+| ۹ | **پاسخ authorize بررسی نمی‌شد** | worker رد شده ولی ماینر بی‌صدا ادامه می‌داد | تشخیص `result:false` + چاپ دلیل + هشدار هنگام خروج |
+| ۱۰ | **تطبیق `\"id\":4` شکننده** | `id:40` هم match می‌شد؛ شمارش share اشتباه | dispatch هر خط کامل و parse عددی `id` |
+
+همچنین: پاک‌سازی stream/buffer در مسیر خطای گراف، اعتبارسنجی port در `parse_pool_url`، و همگام‌سازی رشته‌ی نسخه (v4.3/v4.4 → v5.8) در کل سورس، workflow و فلایت‌شیت.
+
+> ⚠️ کلاینت Stratum در v5.8 کامل‌تر شد ولی **هنوز با استخر زنده PRL تست نشده است** (CUDA در محیط توسعه نبود). منطق پارسر با ۴۵ تست واحد روی داده‌های واقعی‌نمای Kryptex (object-form و array-form) تأیید شده. برای ماینینگ تولیدی از SRBMiner استفاده کنید.
+
+---
+
 ## نصب سریع
 
 ```bash
 cd /hive/miners/custom/
-wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.0/pearlminer_sm89-5.0.tar.gz
-tar -xzf pearlminer_sm89-5.0.tar.gz
+wget https://github.com/Hamid-80/pearlminer-sm89/releases/download/v5.8/pearlminer_sm89-5.8.tar.gz
+tar -xzf pearlminer_sm89-5.8.tar.gz
 chmod +x pearlminer_sm89/*
 cd pearlminer_sm89
 ./pearlminer_sm89 --benchmark 30
